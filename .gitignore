@@ -15,3 +15,4 @@ build/
 test_all.py
 test_house_style.py
 /tmp/
+test_jigsaw.py

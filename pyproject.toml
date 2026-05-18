@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Sergey Blotskiy", email = "sergey@superbanana.io" }
+    { name = "Sergey Blotskiy" }
 ]
 keywords = ["mcp", "testrail", "qa", "test-cases", "jira", "confluence", "claude", "llm"]
 classifiers = [

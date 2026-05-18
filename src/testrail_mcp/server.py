@@ -483,6 +483,25 @@ def _unwrap(data: Any, key: str) -> list:
 
 
 @mcp.tool()
+async def create_suite(
+    name: str,
+    description: str | None = None,
+    project_id: int | None = None,
+) -> dict:
+    """Create a new TestRail suite in a project (only works on multi-suite projects).
+
+    `project_id` defaults to TESTRAIL_PROJECT_ID from env.
+    """
+    pid = project_id or TR_PROJECT_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    payload: dict[str, Any] = {"name": name}
+    if description:
+        payload["description"] = description
+    return await _tr_request("POST", f"add_suite/{pid}", json=payload)
+
+
+@mcp.tool()
 async def list_suites(project_id: int | None = None) -> list[dict]:
     """List suites under a TestRail project.
 
@@ -493,6 +512,53 @@ async def list_suites(project_id: int | None = None) -> list[dict]:
         raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
     data = await _tr_request("GET", f"get_suites/{pid}")
     return _unwrap(data, "suites")
+
+
+@mcp.tool()
+async def list_sections(
+    project_id: int | None = None,
+    suite_id: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """List sections in a suite, returning {id, name, parent_id}.
+
+    Defaults to TESTRAIL_PROJECT_ID / TESTRAIL_SUITE_ID from env when omitted.
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+    if not (pid and sid):
+        raise ValueError("project_id and suite_id required (or set in .env).")
+    data = await _tr_request("GET", f"get_sections/{pid}&suite_id={sid}")
+    sections = _unwrap(data, "sections")
+    return [
+        {"id": s["id"], "name": s["name"], "parent_id": s.get("parent_id")}
+        for s in sections[:limit]
+    ]
+
+
+@mcp.tool()
+async def find_populated_section(
+    project_id: int | None = None,
+    suite_id: int | None = None,
+    min_cases: int = 3,
+    scan_limit: int = 40,
+) -> dict | None:
+    """Find a section that has at least `min_cases` real cases — useful as a
+    house-style anchor when bootstrapping a new feature. Returns the first
+    section meeting the threshold (sections are scanned in TestRail order).
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+    if not (pid and sid):
+        raise ValueError("project_id and suite_id required (or set in .env).")
+    sections = await list_sections(project_id=pid, suite_id=sid, limit=scan_limit)
+    for s in sections:
+        cases = await search_test_cases(
+            project_id=pid, suite_id=sid, section_id=s["id"], limit=min_cases,
+        )
+        if len(cases) >= min_cases:
+            return {**s, "case_count_seen": len(cases)}
+    return None
 
 
 @mcp.tool()
@@ -733,6 +799,138 @@ async def generate_cases_from_confluence(
     )
     result["source"] = {"type": "confluence", "page_id": page_id, "version": version_label}
     return result
+
+
+@mcp.tool()
+async def bootstrap_feature(
+    source_type: str,
+    source_value: str,
+    project_id: int | None = None,
+    new_suite_name: str | None = None,
+    existing_suite_id: int | None = None,
+    section_name: str = "General",
+    style_from_suite_id: int | None = None,
+    push: bool = False,
+) -> dict:
+    """One-shot pipeline: ingest a feature spec, set up TestRail structure, generate cases, push.
+
+    Required:
+      - `source_type`: "confluence" | "jira" | "text"
+      - `source_value`: page_id / issue_key / raw text
+
+    Target:
+      - `project_id` (defaults to env TESTRAIL_PROJECT_ID)
+      - Either `new_suite_name` (creates a new suite) OR `existing_suite_id` (writes into it)
+      - `section_name` — created inside that suite. Hierarchies allowed: "A > B > C".
+
+    House style:
+      - `style_from_suite_id` — pull style anchors from a populated suite (recommended
+        when bootstrapping a brand-new empty suite). If omitted, no style anchors.
+
+    Safety:
+      - `push=False` (default) → dry-run: cases generated and returned, NOTHING is
+        written to TestRail.
+      - `push=True` → suite + section created, cases pushed.
+
+    Returns a full report: suite, section, source meta, cases, created_ids, style info.
+    """
+    pid = project_id or TR_PROJECT_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    if not new_suite_name and not existing_suite_id:
+        raise ValueError("Pass either new_suite_name or existing_suite_id.")
+    if new_suite_name and existing_suite_id:
+        raise ValueError("Pass either new_suite_name OR existing_suite_id, not both.")
+
+    report: dict[str, Any] = {"project_id": pid, "push": push}
+
+    # 1. Source fetch
+    if source_type == "confluence":
+        title, content, version = await _confluence_get_page(source_value)
+        report["source"] = {"type": "confluence", "page_id": source_value, "version": version}
+    elif source_type == "jira":
+        issue = await _jira_get_issue(source_value)
+        title, content, version = _jira_to_context(issue)
+        report["source"] = {"type": "jira", "key": source_value, "version": version}
+    elif source_type == "text":
+        title = "Inline spec"
+        content = source_value
+        report["source"] = {"type": "text"}
+    else:
+        raise ValueError(f"Unknown source_type: {source_type!r}")
+    report["feature_title"] = title
+
+    # 2. House-style anchors (optional)
+    style_examples: list[dict] = []
+    chosen_anchor_section: dict | None = None
+    if style_from_suite_id:
+        try:
+            chosen_anchor_section = await find_populated_section(
+                project_id=pid, suite_id=style_from_suite_id, min_cases=3,
+            )
+            if chosen_anchor_section:
+                style_examples = await _fetch_house_style_examples(
+                    pid, style_from_suite_id, chosen_anchor_section["id"], n=5,
+                )
+        except Exception as e:
+            report["style_warning"] = f"Could not load style anchors: {e}"
+    report["style_anchor"] = (
+        {"suite_id": style_from_suite_id, **(chosen_anchor_section or {})}
+        if style_from_suite_id else None
+    )
+    report["style_examples_used"] = len(style_examples)
+
+    # 3. Generate cases (no push yet — we wire it manually below)
+    cases = _generate_cases_via_claude(
+        title=title,
+        content=content,
+        section=section_name,
+        style_examples=style_examples,
+    )
+    report["cases"] = cases
+    report["cases_count"] = len(cases)
+
+    if not push:
+        report["dry_run"] = True
+        report["note"] = "No TestRail writes performed. Re-run with push=True to commit."
+        return report
+
+    # 4. Create or reuse suite
+    if new_suite_name:
+        suite = await create_suite(
+            name=new_suite_name,
+            description=f"Generated via testrail-mcp bootstrap_feature from {report['source']}",
+            project_id=pid,
+        )
+        suite_id = suite["id"]
+        report["suite"] = {"id": suite_id, "name": new_suite_name, "created": True}
+    else:
+        suite_id = existing_suite_id
+        report["suite"] = {"id": suite_id, "created": False}
+
+    # 5. Create section (hierarchy supported)
+    _section_cache.clear()
+    section_id = await _resolve_section(pid, suite_id, section_name, create_missing=True)
+    report["section"] = {"id": section_id, "path": section_name}
+
+    # 6. Push cases
+    created: list[dict] = []
+    failed: list[dict] = []
+    for c in cases:
+        try:
+            res = await create_test_case(section_id=section_id, case=c)
+            created.append({"id": res["id"], "title": c["title"]})
+            time.sleep(0.3)
+        except Exception as e:
+            failed.append({"title": c["title"], "error": str(e)})
+    report["created"] = created
+    report["failed"] = failed
+    report["created_count"] = len(created)
+    report["failed_count"] = len(failed)
+    report["suite_url"] = (
+        f"{TESTRAIL_BASE_URL}/index.php?/suites/view/{suite_id}" if TESTRAIL_BASE_URL else None
+    )
+    return report
 
 
 def main() -> None:
