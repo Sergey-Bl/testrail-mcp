@@ -29,7 +29,7 @@ All three `generate_cases_*` tools pull a few existing cases from the target sec
 Once the package is on PyPI:
 
 ```bash
-uvx testrail-mcp
+uvx testrail-mcp-server
 ```
 
 For local development from a checkout:
@@ -59,7 +59,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "testrail": {
       "command": "uvx",
-      "args": ["testrail-mcp"],
+      "args": ["testrail-mcp-server"],
       "env": {
         "TESTRAIL_BASE_URL": "https://your-org.testrail.io",
         "TESTRAIL_USER": "you@example.com",
@@ -81,7 +81,7 @@ Restart Claude Desktop. The `testrail` server should appear in the tools menu.
 ### Use in Claude Code
 
 ```bash
-claude mcp add testrail -- uvx testrail-mcp
+claude mcp add testrail -- uvx testrail-mcp-server
 ```
 
 (You'll still need to provide env vars — either via `claude mcp add --env KEY=VALUE` flags or a `.env` in the working directory.)
@@ -95,7 +95,7 @@ In `~/.cursor/mcp.json`:
   "mcpServers": {
     "testrail": {
       "command": "uvx",
-      "args": ["testrail-mcp"],
+      "args": ["testrail-mcp-server"],
       "env": { "TESTRAIL_BASE_URL": "...", "TESTRAIL_USER": "...", "TESTRAIL_API_KEY": "...", "ANTHROPIC_API_KEY": "..." }
     }
   }
