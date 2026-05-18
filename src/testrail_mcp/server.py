@@ -24,7 +24,6 @@ from base64 import b64encode
 from typing import Any
 
 import httpx
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
@@ -48,8 +47,9 @@ CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
 CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL", JIRA_USER)
 CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", JIRA_API_TOKEN)
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GEN_MODEL = os.getenv("CASE_GEN_MODEL", "claude-haiku-4-5-20251001")
+# LLM work is delegated to the client (Claude Desktop / Cursor / Claude Code etc.)
+# via tool-result instructions. The server never calls Anthropic directly so users
+# only pay once — through their existing Claude subscription.
 
 # TestRail defaults — match the original Slack-bot prototype house style
 TR_TEMPLATE_ID = int(os.getenv("TR_TEMPLATE_ID", "2"))   # "Test Case (Steps)"
@@ -351,32 +351,24 @@ def _format_house_style_block(examples: list[dict]) -> str:
     return "\n".join(parts) + "\n"
 
 
-def _generate_cases_via_claude(
-    title: str,
-    content: str,
-    section: str,
-    style_examples: list[dict] | None = None,
-) -> list[dict]:
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    style_block = _format_house_style_block(style_examples or [])
-    user_prompt = (
-        f"Feature: {title}\n"
-        f"Section in TestRail: {section}\n\n"
-        f"{style_block}"
-        f"## SPECIFICATION\n{content[:12000]}\n\n"
-        "Generate test cases for this feature."
-    )
-    msg = client.messages.create(
-        model=GEN_MODEL,
-        max_tokens=8000,
-        system=CASE_GEN_SYSTEM,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    raw = msg.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S)
-    return json.loads(raw)
+CASE_SCHEMA = {
+    "title": "Action-oriented title under 90 chars",
+    "preconditions": "Setup needed (empty string if none)",
+    "steps": [{"step": "User action", "expected": "Observable result"}],
+}
+
+GENERATION_INSTRUCTIONS = (
+    "Generate TestRail test cases for the feature above. Cover happy path, "
+    "edge cases, and negative cases — 15-30 cases depending on feature complexity. "
+    "Group logically: UI elements → core logic → edge cases → config. "
+    "Steps must be atomic (one action per step); 'expected' must be observable, not 'should work'. "
+    "If `style_examples` is non-empty, those cases were authored by humans in this "
+    "TestRail project — match their tone, naming, level of detail, step granularity, "
+    "and expected-result phrasing exactly. A reader should not be able to tell which "
+    "cases are new vs which already existed. "
+    "When you have the cases array, push them in ONE call to `add_test_cases_bulk` "
+    "with the section_hierarchy from `target.section_path` (or section_id if known)."
+)
 
 
 def _normalize_title(t: str) -> str:
@@ -402,18 +394,6 @@ async def _existing_titles_in_section(project_id: int, suite_id: int, section_id
     path = f"get_cases/{project_id}&suite_id={suite_id}&section_id={section_id}&limit=250"
     data = await _tr_request("GET", path)
     return [{"id": c["id"], "title": c.get("title", "")} for c in _unwrap(data, "cases")]
-
-
-async def _claude_json(system: str, user: str, max_tokens: int = 4000) -> Any:
-    """Minimal helper for one-shot Claude calls that should return JSON."""
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model=GEN_MODEL, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    raw = msg.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S)
-    return json.loads(raw)
 
 
 async def _fetch_house_style_examples(
@@ -702,8 +682,68 @@ async def preview_house_style(
     return {"section_id": target_section_id, "examples": examples}
 
 
+async def _prepare_context(
+    text: str,
+    feature_title: str,
+    section_hierarchy: str | None,
+    section_id: int | None,
+    project_id: int | None,
+    suite_id: int | None,
+    house_style: bool,
+    house_style_section_id: int | None,
+    house_style_examples: int,
+) -> dict:
+    """Shared logic: fetch house-style anchors and return everything the client
+    LLM needs to generate cases."""
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+
+    style_examples: list[dict] = []
+    style_section_id = house_style_section_id
+    if house_style and pid and sid and house_style_examples > 0:
+        # Prefer explicit style anchor; otherwise try the target section; otherwise
+        # find any populated section in the suite.
+        if style_section_id is None and section_id:
+            style_section_id = section_id
+        if style_section_id is None and section_hierarchy:
+            try:
+                style_section_id = await _resolve_section(pid, sid, section_hierarchy, False)
+            except Exception:
+                style_section_id = None
+        if style_section_id is None:
+            try:
+                anchor = await find_populated_section(project_id=pid, suite_id=sid)
+                if anchor:
+                    style_section_id = anchor["id"]
+            except Exception:
+                pass
+        if style_section_id:
+            try:
+                style_examples = await _fetch_house_style_examples(
+                    pid, sid, style_section_id, n=house_style_examples
+                )
+            except Exception:
+                style_examples = []
+
+    return {
+        "feature_title": feature_title,
+        "spec": text[:12000],
+        "style_examples": style_examples,
+        "style_section_id": style_section_id if style_examples else None,
+        "style_examples_used": len(style_examples),
+        "target": {
+            "project_id": pid,
+            "suite_id": sid,
+            "section_id": section_id,
+            "section_path": section_hierarchy,
+        },
+        "schema": CASE_SCHEMA,
+        "instructions": GENERATION_INSTRUCTIONS,
+    }
+
+
 @mcp.tool()
-async def generate_cases_from_text(
+async def prepare_cases_from_text(
     text: str,
     feature_title: str = "Untitled feature",
     section_hierarchy: str | None = None,
@@ -714,68 +754,38 @@ async def generate_cases_from_text(
     house_style_section_id: int | None = None,
     house_style_examples: int = 5,
 ) -> dict:
-    """Generate TestRail test cases from a free-form spec/PRD/text.
+    """Fetch the inputs needed to generate TestRail cases from a free-form spec.
 
-    Targeting modes (pick one when you want them created):
-      - `section_id` — push straight into an existing section ID
-      - `section_hierarchy` — like `Auth > Login`; missing nodes are created.
-        Uses TESTRAIL_PROJECT_ID/SUITE_ID from env unless overridden.
+    This is an MCP-native pattern: the server doesn't call an LLM. It returns the
+    spec, the house-style anchors, the target section, and an `instructions` block
+    that tells the calling Claude how to generate cases and where to push them.
 
-    House-style matching:
-      - If `house_style` is True (default) and a target section is known,
-        the server fetches a few existing cases from that section and passes
-        them to Claude as style examples, so new cases match local conventions.
-      - Override the style source with `house_style_section_id` to pull examples
-        from a different "golden" section while writing into another.
+    Targeting modes:
+      - `section_id` — push into an existing section ID later
+      - `section_hierarchy` — like `Auth > Login`; missing nodes will be created
+        when you call `add_test_cases_bulk`. Defaults come from TESTRAIL_PROJECT_ID
+        and TESTRAIL_SUITE_ID env.
 
-    Without a target section, cases are returned but not created in TestRail.
-
-    Returns {"cases", "created_ids", "section_id", "style_section_id", "style_examples_used"}.
+    House-style matching (default on): the server pulls a few existing cases from
+    the target section (or a fallback populated section) so the calling Claude can
+    match the local tone, naming, and step granularity. Override the style source
+    with `house_style_section_id` to pull anchors from a different "golden" section.
     """
-    pid = project_id or TR_PROJECT_ID
-    sid = suite_id or TR_SUITE_ID
-
-    target_section_id = section_id
-    if section_hierarchy and target_section_id is None and pid and sid:
-        target_section_id = await _resolve_section(pid, sid, section_hierarchy, True)
-
-    style_examples: list[dict] = []
-    style_section_id = house_style_section_id or target_section_id
-    if house_style and style_section_id and pid and sid and house_style_examples > 0:
-        try:
-            style_examples = await _fetch_house_style_examples(
-                pid, sid, style_section_id, n=house_style_examples
-            )
-        except Exception:
-            # Style examples are a nice-to-have; never fail the run because of them.
-            style_examples = []
-
-    cases = _generate_cases_via_claude(
-        title=feature_title,
-        content=text,
-        section=section_hierarchy or "ad-hoc",
-        style_examples=style_examples,
+    return await _prepare_context(
+        text=text,
+        feature_title=feature_title,
+        section_hierarchy=section_hierarchy,
+        section_id=section_id,
+        project_id=project_id,
+        suite_id=suite_id,
+        house_style=house_style,
+        house_style_section_id=house_style_section_id,
+        house_style_examples=house_style_examples,
     )
-
-    created_ids: list[int] = []
-    if target_section_id is not None:
-        for c in cases:
-            res = await create_test_case(section_id=target_section_id, case=c)
-            if isinstance(res, dict) and "id" in res:
-                created_ids.append(res["id"])
-            time.sleep(0.3)  # gentle on TestRail rate limit
-
-    return {
-        "cases": cases,
-        "created_ids": created_ids,
-        "section_id": target_section_id,
-        "style_section_id": style_section_id if style_examples else None,
-        "style_examples_used": len(style_examples),
-    }
 
 
 @mcp.tool()
-async def generate_cases_from_jira(
+async def prepare_cases_from_jira(
     issue_key: str,
     section_hierarchy: str | None = None,
     section_id: int | None = None,
@@ -785,14 +795,12 @@ async def generate_cases_from_jira(
     house_style_section_id: int | None = None,
     house_style_examples: int = 5,
 ) -> dict:
-    """Fetch a Jira ticket by key, generate test cases, and optionally push them to TestRail.
-
-    Example: issue_key="ABC-123", section_hierarchy="Auth > Login".
-    Set `house_style=False` to skip pulling sibling cases as style anchors.
+    """Fetch a Jira ticket + house-style anchors. Returns the context the calling
+    Claude needs to generate TestRail cases. Example: issue_key='ABC-123'.
     """
     issue = await _jira_get_issue(issue_key)
     title, content, version_label = _jira_to_context(issue)
-    result = await generate_cases_from_text(
+    result = await _prepare_context(
         text=content,
         feature_title=title,
         section_hierarchy=section_hierarchy,
@@ -808,7 +816,7 @@ async def generate_cases_from_jira(
 
 
 @mcp.tool()
-async def generate_cases_from_confluence(
+async def prepare_cases_from_confluence(
     page_id: str,
     section_hierarchy: str | None = None,
     section_id: int | None = None,
@@ -818,13 +826,12 @@ async def generate_cases_from_confluence(
     house_style_section_id: int | None = None,
     house_style_examples: int = 5,
 ) -> dict:
-    """Fetch a Confluence page by ID, generate test cases, and optionally push them to TestRail.
-
-    `page_id` is the numeric ID (last part of the page URL: `/wiki/spaces/X/pages/<page_id>`).
-    Set `house_style=False` to skip pulling sibling cases as style anchors.
+    """Fetch a Confluence page + house-style anchors. Returns the context the
+    calling Claude needs to generate TestRail cases. `page_id` is the numeric ID
+    from the page URL: `/wiki/spaces/X/pages/<page_id>`.
     """
     title, content, version_label = await _confluence_get_page(page_id)
-    result = await generate_cases_from_text(
+    result = await _prepare_context(
         text=content,
         feature_title=title,
         section_hierarchy=section_hierarchy,
@@ -837,6 +844,57 @@ async def generate_cases_from_confluence(
     )
     result["source"] = {"type": "confluence", "page_id": page_id, "version": version_label}
     return result
+
+
+@mcp.tool()
+async def add_test_cases_bulk(
+    cases: list[dict],
+    section_hierarchy: str | None = None,
+    section_id: int | None = None,
+    project_id: int | None = None,
+    suite_id: int | None = None,
+) -> dict:
+    """Push a batch of test cases to TestRail in one call. Returns the IDs created.
+
+    `cases` items are in the shape returned by `prepare_cases_*` — each has
+    {title, preconditions, steps:[{step, expected}]}. The server maps that into
+    TestRail's payload format (custom_steps_separated etc.).
+
+    Targeting: either `section_id` directly, or `section_hierarchy` like
+    'Auth > Login > Smoke' — missing nodes are created.
+    """
+    if not cases:
+        return {"created": [], "failed": [], "created_count": 0, "failed_count": 0}
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+
+    target_section_id = section_id
+    if target_section_id is None:
+        if not section_hierarchy:
+            raise ValueError("Pass section_id or section_hierarchy.")
+        if not (pid and sid):
+            raise ValueError("project_id and suite_id required (or set in .env).")
+        _section_cache.clear()
+        target_section_id = await _resolve_section(pid, sid, section_hierarchy, True)
+
+    created: list[dict] = []
+    failed: list[dict] = []
+    for c in cases:
+        try:
+            res = await create_test_case(section_id=target_section_id, case=c)
+            created.append({"id": res["id"], "title": c.get("title", "")})
+            time.sleep(0.3)  # gentle on TestRail rate limit
+        except Exception as e:
+            failed.append({"title": c.get("title", ""), "error": str(e)})
+
+    return {
+        "section_id": target_section_id,
+        "section_path": section_hierarchy,
+        "created": created,
+        "failed": failed,
+        "created_count": len(created),
+        "failed_count": len(failed),
+    }
 
 
 @mcp.tool()
@@ -891,102 +949,62 @@ async def dedupe_against_section(
     }
 
 
-LINT_SYSTEM = """You are a senior QA lead reviewing test cases for a TestRail project.
-Output ONLY valid JSON, no markdown.
-
-For each case index, flag concrete quality issues. Return:
-[
-  {"index": 0, "warnings": ["vague title", "expected too generic on step 2"]},
-  ...
-]
-
-Only include indexes that have warnings. Skip well-written cases.
-Be terse — each warning under 12 words, actionable.
-
-Common issues to flag:
-- vague or generic titles ("Test feature works")
-- missing or empty preconditions where the test obviously needs setup
-- 'expected' results that say "should work" / "no errors" instead of observable state
-- steps that combine multiple actions into one
-- redundant cases that duplicate another in the same batch
-- missing negative or edge cases for an obvious risk in the feature"""
+LINT_INSTRUCTIONS = (
+    "Review each case for concrete quality issues. Common things to flag:\n"
+    "- vague or generic titles (\"Test feature works\")\n"
+    "- missing preconditions where the test obviously needs setup\n"
+    "- 'expected' results that say \"should work\" / \"no errors\" instead of observable state\n"
+    "- steps that combine multiple actions into one\n"
+    "- redundant cases that duplicate another in the same batch\n"
+    "- missing negative or edge cases for an obvious risk in the feature\n"
+    "Output a JSON array of `{index, title, warnings: [terse strings under 12 words]}` "
+    "covering ONLY cases with issues. Skip the well-written ones."
+)
 
 
 @mcp.tool()
-async def lint_cases(cases: list[dict], feature_title: str = "") -> dict:
-    """Run a QA-quality lint over generated cases via Claude.
+async def prepare_lint(cases: list[dict], feature_title: str = "") -> dict:
+    """Return the case batch alongside lint instructions for the calling Claude to evaluate.
 
-    Returns {"warnings": [{"index", "title", "warnings": [...]}], "warning_count"}.
+    No LLM call happens server-side — the client Claude reviews the cases using
+    its own context and reports back, paid for by the user's subscription.
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
-    if not cases:
-        return {"warnings": [], "warning_count": 0}
-    payload = []
-    for i, c in enumerate(cases):
-        payload.append({
-            "index": i,
-            "title": c.get("title", ""),
-            "preconditions": c.get("preconditions", ""),
-            "steps": c.get("steps", []),
-        })
-    user = (
-        f"Feature: {feature_title or '(unspecified)'}\n\n"
-        f"Cases to review (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
-    )
-    raw_warnings = await _claude_json(LINT_SYSTEM, user, max_tokens=4000)
-    warnings = []
-    for w in raw_warnings:
-        idx = w.get("index")
-        if idx is None or idx >= len(cases):
-            continue
-        warnings.append({
-            "index": idx,
-            "title": cases[idx].get("title", ""),
-            "warnings": w.get("warnings", []),
-        })
-    return {"warnings": warnings, "warning_count": len(warnings)}
+    indexed = [
+        {"index": i, "title": c.get("title", ""), "preconditions": c.get("preconditions", ""),
+         "steps": c.get("steps", [])}
+        for i, c in enumerate(cases)
+    ]
+    return {
+        "feature_title": feature_title,
+        "cases": indexed,
+        "cases_count": len(cases),
+        "instructions": LINT_INSTRUCTIONS,
+    }
 
 
-COVERAGE_SYSTEM = """You are a QA architect. Given a feature spec and a list of test
-case titles generated from it, identify what testable behaviour from the spec is
-NOT covered by any case.
-
-Output ONLY valid JSON:
-{
-  "gaps": ["short description of an uncovered behaviour", ...],
-  "weak_areas": ["aspect that has only shallow coverage", ...]
-}
-
-Rules:
-- 'gaps' must be concrete behaviours mentioned (or strongly implied) by the spec.
-- Do not invent requirements that are not in the spec.
-- Each gap under 20 words, written as a testable behaviour.
-- If the spec is fully covered, return {"gaps": [], "weak_areas": []}.
-- Maximum 10 gaps + 5 weak_areas."""
+COVERAGE_INSTRUCTIONS = (
+    "Identify testable behaviours in the spec that are NOT covered by any of the listed cases.\n"
+    "Output a JSON object: `{gaps: [...], weak_areas: [...]}`. Each gap under 20 words, "
+    "written as a testable behaviour. Do not invent requirements not in the spec. Max 10 gaps + 5 weak_areas. "
+    "If the spec is fully covered, return both arrays empty."
+)
 
 
 @mcp.tool()
-async def coverage_gaps(
+async def prepare_coverage_gaps(
     spec_text: str,
     cases: list[dict],
     feature_title: str = "",
 ) -> dict:
-    """Use Claude to find behaviours in the spec that are not covered by the case set."""
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
-    titles = [c.get("title", "") for c in cases]
-    user = (
-        f"Feature: {feature_title or '(unspecified)'}\n\n"
-        f"## SPEC\n{spec_text[:12000]}\n\n"
-        f"## EXISTING CASE TITLES ({len(titles)})\n"
-        + "\n".join(f"- {t}" for t in titles)
-    )
-    result = await _claude_json(COVERAGE_SYSTEM, user, max_tokens=2000)
+    """Return the spec and the existing case titles, plus instructions for the
+    calling Claude to find missing coverage. No LLM call happens server-side.
+    """
     return {
-        "gaps": result.get("gaps", []),
-        "weak_areas": result.get("weak_areas", []),
-        "gaps_count": len(result.get("gaps", [])),
+        "feature_title": feature_title,
+        "spec": spec_text[:12000],
+        "case_titles": [c.get("title", "") for c in cases],
+        "cases_count": len(cases),
+        "instructions": COVERAGE_INSTRUCTIONS,
     }
 
 
@@ -1085,64 +1103,40 @@ async def get_results_for_run(run_id: int, limit: int = 250) -> list[dict]:
     } for r in results[:limit]]
 
 
-SUMMARIZE_RUN_SYSTEM = """You are a senior QA lead writing a release-readiness
-status report from a TestRail test run. Output GitHub-flavoured Markdown.
-
-Structure (use these section headings exactly):
-
-## Summary
-One short paragraph (3-4 sentences) for non-QA stakeholders: what was tested,
-pass rate, ship-readiness verdict.
-
-## Stats
-A compact table of counts: Passed / Failed / Blocked / Retest / Untested,
-plus pass rate percentage of executed tests.
-
-## Top failures
-Up to 8 most concerning failures. Group by area or root cause when obvious.
-For each, give:
-- The test title (verbatim)
-- One-line hypothesis of what's broken, drawn from the tester comment
-
-## Risk areas
-2-5 short bullets calling out: clusters of failures in a feature, low coverage
-visible in the breakdown, blocked tests that hide real signal, anything a
-release manager should know.
-
-## Recommendation
-One of: **READY**, **NEEDS ATTENTION**, **BLOCKED** — followed by one short
-paragraph explaining why and what unblocks the next decision.
-
-Rules:
-- Be concrete. Cite test names. No filler.
-- Do not invent counts or test names — use only what the input contains.
-- If untested ratio > 30%, call it out as a "coverage gap" risk.
-- If the same test appears repeatedly across runs (you won't see this — only
-  current run is provided), flag it as "potentially flaky — verify across runs"."""
+SUMMARIZE_RUN_INSTRUCTIONS = (
+    "Write a release-readiness status report from this TestRail run data, as "
+    "GitHub-flavoured Markdown with these sections (use the headings exactly):\n"
+    "## Summary — 3-4 sentences for non-QA stakeholders: what was tested, pass rate, "
+    "ship-readiness verdict.\n"
+    "## Stats — compact table of Passed/Failed/Blocked/Retest/Untested + pass rate %.\n"
+    "## Top failures — up to 8 most concerning failures. For each: test title verbatim + "
+    "one-line hypothesis drawn from the tester comment. Group by area when obvious.\n"
+    "## Risk areas — 2-5 short bullets: clusters of failures, low coverage, blocked tests "
+    "hiding signal, anything a release manager should know.\n"
+    "## Recommendation — one of **READY** / **NEEDS ATTENTION** / **BLOCKED**, plus one "
+    "short paragraph why and what unblocks the next decision.\n"
+    "Rules: be concrete, cite test names, no filler. Do not invent counts or test names — "
+    "use only what's in the input. If untested ratio > 30%, call out 'coverage gap' risk."
+)
 
 
 @mcp.tool()
-async def summarize_run(
+async def prepare_run_summary(
     run_id: int,
     include_passed_titles: bool = False,
 ) -> dict:
-    """Generate a human-readable Markdown report for a test run.
+    """Pull run metadata, statuses, and failure comments — return the structured
+    payload + report instructions for the calling Claude to synthesise into Markdown.
 
-    Pulls run metadata, current per-test statuses, and per-failure comments,
-    then asks Claude to synthesise a release-readiness report.
+    No LLM call happens server-side. Claude in the client writes the report.
 
-    `include_passed_titles=False` (default) keeps the prompt compact — Claude
-    sees only failure/blocked/retest details plus aggregate pass counts. Set
-    True only for tiny runs (<50 tests) when you want full granularity.
+    `include_passed_titles=False` (default) keeps the payload compact for big runs.
+    Set True only for tiny runs (<50 tests) when full granularity is useful.
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
-
     run = await get_run(run_id)
     tests = await get_tests_in_run(run_id, limit=500)
     results = await get_results_for_run(run_id, limit=500)
 
-    # Index latest result per test
     latest_by_test: dict[int, dict] = {}
     for r in results:
         tid = r.get("test_id")
@@ -1151,7 +1145,6 @@ async def summarize_run(
         if tid not in latest_by_test:
             latest_by_test[tid] = r
 
-    # Bucket tests by status
     buckets: dict[str, list[dict]] = {k: [] for k in TR_STATUS.values()}
     for t in tests:
         bucket = TR_STATUS.get(t["status_id"], "unknown")
@@ -1165,8 +1158,7 @@ async def summarize_run(
     executed = counts.get("passed", 0) + counts.get("failed", 0) + counts.get("blocked", 0) + counts.get("retest", 0)
     pass_rate = (counts.get("passed", 0) / executed * 100) if executed else 0.0
 
-    # Build compact input
-    payload = {
+    payload: dict[str, Any] = {
         "run": {
             "id": run.get("id"),
             "name": run.get("name"),
@@ -1182,26 +1174,11 @@ async def summarize_run(
         "blocked": buckets.get("blocked", [])[:25],
         "retest": buckets.get("retest", [])[:25],
         "untested_count": counts.get("untested", 0),
+        "instructions": SUMMARIZE_RUN_INSTRUCTIONS,
     }
     if include_passed_titles:
         payload["passed_titles"] = [t["title"] for t in buckets.get("passed", [])[:200]]
-
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model=GEN_MODEL,
-        max_tokens=4000,
-        system=SUMMARIZE_RUN_SYSTEM,
-        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-    )
-    markdown = msg.content[0].text.strip()
-
-    return {
-        "run_id": run_id,
-        "run_name": run.get("name"),
-        "counts": counts,
-        "pass_rate_pct": payload["pass_rate_pct"],
-        "report_markdown": markdown,
-    }
+    return payload
 
 
 @mcp.tool()
@@ -1367,48 +1344,34 @@ async def update_case(case_id: int, fields: dict) -> dict:
     return await _tr_request("POST", f"update_case/{case_id}", json=fields)
 
 
-COMPARE_RUNS_SYSTEM = """You compare two TestRail runs and write a regression
-delta report in GitHub-flavoured Markdown. Output ONLY the report, no preamble.
-
-Structure (exact headings):
-
-## Headline
-One sentence: did things get better or worse, and by how much.
-
-## Regressions (was passing → now failing)
-Bullet list, test title + one-line hypothesis if a comment hints at the cause.
-Skip this section entirely (drop the heading) if empty.
-
-## Fixed (was failing → now passing)
-Bullet list of test titles.
-
-## Newly tested
-Tests that exist in B but not A.
-
-## No longer covered
-Tests that exist in A but not B.
-
-## Verdict
-**BETTER** / **WORSE** / **MIXED** — and one short paragraph why.
-
-Rules:
-- Cite test titles verbatim. No invented data.
-- Order regressions by perceived severity (the worse-sounding comments first).
-- Be terse — bullets, not paragraphs."""
+COMPARE_RUNS_INSTRUCTIONS = (
+    "Write a regression-delta report in GitHub-flavoured Markdown using the data above. "
+    "Use these section headings exactly:\n"
+    "## Headline — one sentence: did things get better or worse, by how much.\n"
+    "## Regressions (was passing → now failing) — bullet list, test title + one-line hypothesis "
+    "if the comment hints at cause. Skip the section (drop the heading) if empty.\n"
+    "## Fixed (was failing → now passing) — bullet list of titles.\n"
+    "## Newly tested — tests in B but not A.\n"
+    "## No longer covered — tests in A but not B.\n"
+    "## Verdict — **BETTER** / **WORSE** / **MIXED** + one short paragraph why.\n"
+    "Cite titles verbatim. No invented data. Order regressions by perceived severity "
+    "(worst-sounding comments first). Be terse — bullets, not paragraphs."
+)
 
 
 @mcp.tool()
-async def compare_runs(run_id_a: int, run_id_b: int) -> dict:
-    """Diff two runs (A = older/baseline, B = newer) and ask Claude for a narrative.
+async def prepare_runs_diff(run_id_a: int, run_id_b: int) -> dict:
+    """Compute the regression / fix / coverage delta between two runs and return
+    the structured data + narrate instructions for the calling Claude.
 
-    Returns the raw status delta plus a Markdown report.
+    A is the baseline (older), B is the newer run. No LLM call happens server-side.
     """
     tests_a, tests_b = await asyncio.gather(
         get_tests_in_run(run_id_a, limit=500),
         get_tests_in_run(run_id_b, limit=500),
     )
     results_b = await get_results_for_run(run_id_b, limit=500)
-    latest_b_by_test = {}
+    latest_b_by_test: dict[int, dict] = {}
     for r in results_b:
         tid = r.get("test_id")
         if tid and tid not in latest_b_by_test:
@@ -1433,7 +1396,7 @@ async def compare_runs(run_id_a: int, run_id_b: int) -> dict:
         if cid not in by_case_a:
             new_in_b.append({"title": tb["title"]})
 
-    delta = {
+    return {
         "run_a": run_id_a,
         "run_b": run_id_b,
         "regressions": regressions,
@@ -1446,20 +1409,8 @@ async def compare_runs(run_id_a: int, run_id_b: int) -> dict:
             "new_in_b": len(new_in_b),
             "gone_in_b": len(gone_in_b),
         },
+        "instructions": COMPARE_RUNS_INSTRUCTIONS,
     }
-
-    if not ANTHROPIC_API_KEY:
-        return delta
-
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model=GEN_MODEL,
-        max_tokens=3000,
-        system=COMPARE_RUNS_SYSTEM,
-        messages=[{"role": "user", "content": json.dumps(delta, ensure_ascii=False)}],
-    )
-    delta["report_markdown"] = msg.content[0].text.strip()
-    return delta
 
 
 @mcp.tool()
@@ -1516,8 +1467,22 @@ async def flaky_test_detector(
     }
 
 
+BOOTSTRAP_INSTRUCTIONS = (
+    "Multi-step workflow for the calling Claude:\n"
+    "1. Read `spec`, `style_examples`, and `target` below.\n"
+    "2. Generate cases as a JSON array using the `schema` shape — match the style "
+    "of `style_examples` exactly (Title Case, step granularity, expected phrasing, etc.).\n"
+    "3. Optionally call `prepare_lint` and `prepare_coverage_gaps` on the array to "
+    "self-review before pushing.\n"
+    "4. To actually create the cases, call `add_test_cases_bulk` ONCE with the cases "
+    "array and `section_hierarchy` from `target.section_path`. If the suite doesn't "
+    "exist yet (the user asked for `new_suite_name`), first call `create_suite`, then "
+    "pass its `id` to `add_test_cases_bulk` as `suite_id`."
+)
+
+
 @mcp.tool()
-async def bootstrap_feature(
+async def prepare_feature_bootstrap(
     source_type: str,
     source_value: str,
     project_id: int | None = None,
@@ -1525,33 +1490,23 @@ async def bootstrap_feature(
     existing_suite_id: int | None = None,
     section_name: str = "General",
     style_from_suite_id: int | None = None,
-    push: bool = False,
-    dedupe: bool = True,
-    lint: bool = True,
-    find_gaps: bool = True,
-    dedupe_threshold: float = 0.65,
 ) -> dict:
-    """One-shot pipeline: ingest a feature spec, set up TestRail structure, generate cases, push.
+    """Prepare a feature-import workflow: fetch the spec, pull house-style anchors,
+    and return everything the calling Claude needs to drive generation and push.
+
+    No LLM call happens server-side. Claude in the client generates cases (with the
+    instructions and style examples this tool returns) and then calls
+    `add_test_cases_bulk` to commit them.
 
     Required:
       - `source_type`: "confluence" | "jira" | "text"
       - `source_value`: page_id / issue_key / raw text
+      - either `new_suite_name` (creates a new suite when you push) or `existing_suite_id`
+      - `section_name` — hierarchy allowed: "A > B > C"
 
-    Target:
-      - `project_id` (defaults to env TESTRAIL_PROJECT_ID)
-      - Either `new_suite_name` (creates a new suite) OR `existing_suite_id` (writes into it)
-      - `section_name` — created inside that suite. Hierarchies allowed: "A > B > C".
-
-    House style:
-      - `style_from_suite_id` — pull style anchors from a populated suite (recommended
-        when bootstrapping a brand-new empty suite). If omitted, no style anchors.
-
-    Safety:
-      - `push=False` (default) → dry-run: cases generated and returned, NOTHING is
-        written to TestRail.
-      - `push=True` → suite + section created, cases pushed.
-
-    Returns a full report: suite, section, source meta, cases, created_ids, style info.
+    Optional:
+      - `style_from_suite_id` — pull style anchors from a populated suite. Recommended
+        when you're bootstrapping a brand-new empty suite that has no cases yet.
     """
     pid = project_id or TR_PROJECT_ID
     if not pid:
@@ -1561,25 +1516,22 @@ async def bootstrap_feature(
     if new_suite_name and existing_suite_id:
         raise ValueError("Pass either new_suite_name OR existing_suite_id, not both.")
 
-    report: dict[str, Any] = {"project_id": pid, "push": push}
-
     # 1. Source fetch
     if source_type == "confluence":
         title, content, version = await _confluence_get_page(source_value)
-        report["source"] = {"type": "confluence", "page_id": source_value, "version": version}
+        source = {"type": "confluence", "page_id": source_value, "version": version}
     elif source_type == "jira":
         issue = await _jira_get_issue(source_value)
         title, content, version = _jira_to_context(issue)
-        report["source"] = {"type": "jira", "key": source_value, "version": version}
+        source = {"type": "jira", "key": source_value, "version": version}
     elif source_type == "text":
         title = "Inline spec"
         content = source_value
-        report["source"] = {"type": "text"}
+        source = {"type": "text"}
     else:
         raise ValueError(f"Unknown source_type: {source_type!r}")
-    report["feature_title"] = title
 
-    # 2. House-style anchors (optional)
+    # 2. House-style anchors
     style_examples: list[dict] = []
     chosen_anchor_section: dict | None = None
     if style_from_suite_id:
@@ -1591,107 +1543,42 @@ async def bootstrap_feature(
                 style_examples = await _fetch_house_style_examples(
                     pid, style_from_suite_id, chosen_anchor_section["id"], n=5,
                 )
-        except Exception as e:
-            report["style_warning"] = f"Could not load style anchors: {e}"
-    report["style_anchor"] = (
-        {"suite_id": style_from_suite_id, **(chosen_anchor_section or {})}
-        if style_from_suite_id else None
-    )
-    report["style_examples_used"] = len(style_examples)
-
-    # 3. Generate cases (no push yet — we wire it manually below)
-    cases = _generate_cases_via_claude(
-        title=title,
-        content=content,
-        section=section_name,
-        style_examples=style_examples,
-    )
-    report["cases"] = cases
-    report["cases_count"] = len(cases)
-
-    # 4. Lint + coverage-gap analysis (non-blocking, advisory)
-    if lint:
+        except Exception:
+            pass
+    elif existing_suite_id:
+        # Try the target suite itself for style anchors
         try:
-            report["lint"] = await lint_cases(cases, feature_title=title)
-        except Exception as e:
-            report["lint"] = {"error": str(e)}
-    if find_gaps:
-        try:
-            report["coverage"] = await coverage_gaps(
-                spec_text=content, cases=cases, feature_title=title
+            anchor = await find_populated_section(
+                project_id=pid, suite_id=existing_suite_id, min_cases=3,
             )
-        except Exception as e:
-            report["coverage"] = {"error": str(e)}
-
-    # 5. Resolve target suite (create new OR use existing) — needed for dedupe and push
-    if push or (dedupe and existing_suite_id):
-        if new_suite_name:
-            if push:
-                suite = await create_suite(
-                    name=new_suite_name,
-                    description=f"Generated via testrail-mcp bootstrap_feature from {report['source']}",
-                    project_id=pid,
+            if anchor:
+                chosen_anchor_section = anchor
+                style_examples = await _fetch_house_style_examples(
+                    pid, existing_suite_id, anchor["id"], n=5,
                 )
-                suite_id = suite["id"]
-                report["suite"] = {"id": suite_id, "name": new_suite_name, "created": True}
-            else:
-                suite_id = None
-                report["suite"] = {"name": new_suite_name, "created": False, "would_create_on_push": True}
-        else:
-            suite_id = existing_suite_id
-            report["suite"] = {"id": suite_id, "created": False}
-    else:
-        suite_id = None
-        report["suite"] = None
+        except Exception:
+            pass
 
-    # 6. Dedupe vs existing section content (only meaningful if target section exists)
-    if dedupe and suite_id and existing_suite_id:
-        # Resolve section without creating, only to check duplicates against an existing target
-        try:
-            existing_section_id = await _resolve_section(
-                pid, suite_id, section_name, create_missing=False
-            )
-            dd = await dedupe_against_section(
-                cases=cases, section_id=existing_section_id,
-                project_id=pid, suite_id=suite_id, threshold=dedupe_threshold,
-            )
-            report["dedupe"] = {
-                "duplicates_count": dd["duplicates_count"],
-                "duplicates": dd["duplicates"],
-                "kept_count": dd["kept_count"],
-            }
-            cases = [item["case"] for item in dd["kept"]]
-        except Exception as e:
-            report["dedupe"] = {"skipped_reason": str(e)}
-
-    if not push:
-        report["dry_run"] = True
-        report["note"] = "No TestRail writes performed. Re-run with push=True to commit."
-        return report
-
-    # 7. Create section (hierarchy supported)
-    _section_cache.clear()
-    section_id = await _resolve_section(pid, suite_id, section_name, create_missing=True)
-    report["section"] = {"id": section_id, "path": section_name}
-
-    # 8. Push remaining (post-dedupe) cases
-    created: list[dict] = []
-    failed: list[dict] = []
-    for c in cases:
-        try:
-            res = await create_test_case(section_id=section_id, case=c)
-            created.append({"id": res["id"], "title": c["title"]})
-            time.sleep(0.3)
-        except Exception as e:
-            failed.append({"title": c["title"], "error": str(e)})
-    report["created"] = created
-    report["failed"] = failed
-    report["created_count"] = len(created)
-    report["failed_count"] = len(failed)
-    report["suite_url"] = (
-        f"{TESTRAIL_BASE_URL}/index.php?/suites/view/{suite_id}" if TESTRAIL_BASE_URL else None
-    )
-    return report
+    return {
+        "project_id": pid,
+        "feature_title": title,
+        "spec": content[:12000],
+        "source": source,
+        "suite_plan": (
+            {"create_new": True, "name": new_suite_name}
+            if new_suite_name else
+            {"create_new": False, "suite_id": existing_suite_id}
+        ),
+        "target": {"section_path": section_name},
+        "style_examples": style_examples,
+        "style_examples_used": len(style_examples),
+        "style_anchor": (
+            {"suite_id": style_from_suite_id or existing_suite_id, **(chosen_anchor_section or {})}
+            if chosen_anchor_section else None
+        ),
+        "schema": CASE_SCHEMA,
+        "instructions": BOOTSTRAP_INSTRUCTIONS,
+    }
 
 
 def main() -> None:

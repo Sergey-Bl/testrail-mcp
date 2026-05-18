@@ -1,8 +1,10 @@
 # testrail-mcp
 
-An MCP server for TestRail that goes beyond CRUD: it generates real test cases from Jira tickets or any free-form spec, optionally pushing them straight into TestRail.
+An MCP server for TestRail that goes beyond CRUD: it prepares everything an MCP client needs to generate real test cases from Jira tickets, Confluence pages, or any free-form spec — and pushes them back to TestRail.
 
 Built on the official Python MCP SDK ([FastMCP](https://github.com/modelcontextprotocol/python-sdk)). Designed to plug into Claude Desktop, Claude Code, Cursor, or any other MCP-capable client.
+
+**No `ANTHROPIC_API_KEY` required.** The server never calls an LLM. It fetches data (Jira/Confluence/TestRail), bundles in house-style anchors, and returns it with instructions for your MCP client. The LLM work happens in your client (Claude Desktop / Cursor / etc.) on your existing subscription — you pay once.
 
 ## What it gives you
 
@@ -14,13 +16,14 @@ Built on the official Python MCP SDK ([FastMCP](https://github.com/modelcontextp
 - `create_test_case` — create a case in a section
 - `get_or_create_section` — resolve a path like `Auth > Login > Edge Cases`, creating missing nodes
 
-**AI tools (the actual differentiator)**
-- `generate_cases_from_text` — feed a PRD chunk / spec / bug report → get TestRail-shaped cases, optionally created in the given section (by ID or by hierarchy string)
-- `generate_cases_from_jira` — pass a Jira issue key (e.g. `ABC-123`); server fetches summary, description, comments, subtasks, walks the ADF tree, generates cases
-- `generate_cases_from_confluence` — pass a Confluence page ID; same flow, HTML body stripped to plain text
-- `preview_house_style` — see the 5 sibling cases that will be passed to Claude as in-context style anchors
+**Preparation tools — fetch + bundle data, hand off to your MCP client's LLM**
+- `prepare_cases_from_text` — feed any spec/PRD/bug-report text → returns spec + house-style anchors + schema + instructions for the client to generate cases.
+- `prepare_cases_from_jira` — pass a Jira issue key (e.g. `ABC-123`); server fetches summary, description, comments, subtasks, walks the ADF tree.
+- `prepare_cases_from_confluence` — pass a Confluence page ID; HTML body stripped to plain text.
+- `preview_house_style` — see the 5 sibling cases the server will use as in-context style anchors.
+- `add_test_cases_bulk` — once the LLM has the cases array, push them all into TestRail in one call (with auto section-hierarchy creation).
 
-All three `generate_cases_*` tools pull a few existing cases from the target section and feed them to Claude as house-style examples by default, so new cases match local title casing, step granularity, and expected-result phrasing. Override with `house_style_section_id` to draw style from a different "golden" section, or set `house_style=False` to skip.
+All three `prepare_cases_*` tools pull a few existing cases from the target section as house-style examples by default, so generated cases match local title casing, step granularity, and expected-result phrasing. Override with `house_style_section_id` to draw style from a different "golden" section, or set `house_style=False` to skip.
 
 ## Quick start
 
@@ -66,7 +69,6 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
         "TESTRAIL_API_KEY": "...",
         "TESTRAIL_PROJECT_ID": "1",
         "TESTRAIL_SUITE_ID": "1",
-        "ANTHROPIC_API_KEY": "sk-ant-...",
         "JIRA_BASE_URL": "https://your-org.atlassian.net",
         "JIRA_USER": "you@example.com",
         "JIRA_API_TOKEN": "..."
@@ -96,7 +98,7 @@ In `~/.cursor/mcp.json`:
     "testrail": {
       "command": "uvx",
       "args": ["testrail-mcp-server"],
-      "env": { "TESTRAIL_BASE_URL": "...", "TESTRAIL_USER": "...", "TESTRAIL_API_KEY": "...", "ANTHROPIC_API_KEY": "..." }
+      "env": { "TESTRAIL_BASE_URL": "...", "TESTRAIL_USER": "...", "TESTRAIL_API_KEY": "..." }
     }
   }
 }
@@ -114,12 +116,10 @@ In `~/.cursor/mcp.json`:
 | `TR_TEMPLATE_ID`        | optional | default template (2 = "Test Case (Steps)")             |
 | `TR_TYPE_ID`            | optional | default case type                                      |
 | `TR_PRIORITY_ID`        | optional | default priority (3 = Medium)                          |
-| `ANTHROPIC_API_KEY`     | yes      | required for AI generation tools                       |
-| `CASE_GEN_MODEL`        | optional | defaults to `claude-haiku-4-5-20251001` (cheap + fast) |
-| `JIRA_BASE_URL`         | optional | only for `generate_cases_from_jira`                    |
+| `JIRA_BASE_URL`         | optional | only for `prepare_cases_from_jira`                     |
 | `JIRA_USER`             | optional | Jira account email                                     |
 | `JIRA_API_TOKEN`        | optional | https://id.atlassian.com/manage-profile                |
-| `CONFLUENCE_BASE_URL`   | optional | only for `generate_cases_from_confluence`              |
+| `CONFLUENCE_BASE_URL`   | optional | only for `prepare_cases_from_confluence`               |
 | `CONFLUENCE_EMAIL`      | optional | defaults to `JIRA_USER`                                |
 | `CONFLUENCE_API_TOKEN`  | optional | defaults to `JIRA_API_TOKEN`                           |
 
@@ -136,19 +136,19 @@ The server walks the section path (creating missing nodes), pulls the Jira ticke
 In addition to the basics above:
 
 **Test-case authoring & QA**
-- `bootstrap_feature` — one-shot pipeline: ingest a Confluence page / Jira ticket / raw spec, generate cases with house-style anchors, run lint + coverage-gap analysis, optionally dedupe against an existing section, push to TestRail. `push=False` for dry-run.
-- `dedupe_against_section` — flag generated cases that look like duplicates of cases already in a target section (title-token overlap; configurable `threshold`).
-- `lint_cases` — Claude reviews a batch of cases and flags vague titles, generic "should work" expecteds, combined steps, missing preconditions, etc.
-- `coverage_gaps` — Claude compares the original spec to the generated case set and lists testable behaviours that aren't covered.
+- `prepare_feature_bootstrap` — one-shot: ingest a Confluence page / Jira ticket / raw spec, plan the suite + section, fetch house-style anchors. Hand it all back to the client LLM with step-by-step instructions for generation + push.
+- `dedupe_against_section` — flag generated cases that look like duplicates of cases already in a target section (title-token containment; configurable `threshold`).
+- `prepare_lint` — return the case batch + lint instructions; the client LLM reviews and reports vague titles, generic expecteds, combined steps, etc.
+- `prepare_coverage_gaps` — return the spec + case titles + instructions; the client LLM lists testable behaviours not covered.
 - `list_sections`, `find_populated_section`, `create_suite`, `update_case` — CRUD helpers.
 
 **Test-run management & reporting**
 - `list_runs`, `get_run`, `get_tests_in_run`, `get_results_for_run` — read-side access.
 - `create_run`, `update_run`, `close_run` — write-side. Pair with CI to auto-create a run per build.
 - `add_result`, `add_bulk_results` — post results back from automation. Status accepts either a string (`"passed"`, `"failed"`, `"blocked"`, `"retest"`) or a TestRail status_id.
-- `summarize_run` — Claude generates a ship-ready Markdown report (executive summary, top failures, risk areas, verdict).
-- `compare_runs(run_a, run_b)` — regression/fix delta between two runs, narrated as Markdown.
-- `flaky_test_detector(case_id, last_n_runs)` — pull a case's status across recent runs and flag flakiness when it flips between pass/fail.
+- `prepare_run_summary` — fetch run metadata + statuses + failure comments; client LLM writes the ship-ready Markdown report.
+- `prepare_runs_diff(run_a, run_b)` — regression/fix delta between two runs; client LLM narrates the diff as Markdown.
+- `flaky_test_detector(case_id, last_n_runs)` — pull a case's status across recent runs and flag flakiness when it flips between pass/fail. Pure data, no LLM needed.
 
 ## Roadmap
 
