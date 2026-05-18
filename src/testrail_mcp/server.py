@@ -1168,8 +1168,18 @@ async def bootstrap_feature(
 
 
 def main() -> None:
-    """Console entry point used by `testrail-mcp` script and `uvx testrail-mcp`."""
-    mcp.run()
+    """Console entry point. Transport is selected via MCP_TRANSPORT env var:
+      - unset / "stdio" → default stdio (Claude Desktop, Cursor, local uvx).
+      - "http" → HTTP streamable transport on PORT (for hosted runtimes like Smithery).
+      - "sse" → SSE transport on PORT (legacy hosted clients).
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    if transport in ("http", "streamable-http", "sse"):
+        mcp.settings.host = os.getenv("HOST", "0.0.0.0")
+        mcp.settings.port = int(os.getenv("PORT", "8080"))
+        mcp.run(transport="sse" if transport == "sse" else "streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
