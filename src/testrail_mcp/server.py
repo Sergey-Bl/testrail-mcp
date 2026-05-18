@@ -281,17 +281,90 @@ Rules:
 - Expected results should be specific and verifiable
 - Group logically: UI elements → core logic → edge cases → config
 - 15-30 cases total depending on feature complexity
-- Titles in English"""
+- Titles in English
+
+If "## HOUSE STYLE EXAMPLES" appears in the user message, the cases there
+were authored by humans in this exact TestRail project. Match their tone,
+naming, level of detail, step granularity, expected-result phrasing, and
+how preconditions are written. The goal is that a reader cannot tell which
+cases are new vs which already existed."""
 
 
-def _generate_cases_via_claude(title: str, content: str, section: str) -> list[dict]:
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+);")
+_WHITESPACE_RE = re.compile(r"[ \t]*\n[ \t]*")
+
+
+def _clean_richtext(s: str) -> str:
+    """TestRail stores case bodies as HTML-flavoured markup. Strip tags for clean
+    style examples; collapse whitespace; decode the most common entities."""
+    if not s:
+        return ""
+    txt = _HTML_TAG_RE.sub("", s)
+    txt = (txt.replace("&nbsp;", " ")
+              .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+              .replace("&quot;", '"').replace("&#39;", "'"))
+    txt = _HTML_ENTITY_RE.sub("", txt)
+    txt = _WHITESPACE_RE.sub("\n", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+def _simplify_case(case: dict) -> dict:
+    """Reduce a raw TestRail case to {title, preconditions, steps[{step, expected}]} —
+    the same shape our AI emits, so it's directly usable as a style example.
+    Strips TestRail's HTML markup so Claude sees clean prose."""
+    steps_raw = case.get("custom_steps_separated") or []
+    steps = [
+        {
+            "step": _clean_richtext(s.get("content", "")),
+            "expected": _clean_richtext(s.get("expected", "")),
+        }
+        for s in steps_raw
+    ]
+    if not steps and case.get("custom_steps"):
+        steps = [{"step": _clean_richtext(case["custom_steps"]), "expected": ""}]
+    return {
+        "title": case.get("title", "").strip(),
+        "preconditions": _clean_richtext(case.get("custom_preconds") or ""),
+        "steps": steps,
+    }
+
+
+def _format_house_style_block(examples: list[dict]) -> str:
+    if not examples:
+        return ""
+    parts = ["## HOUSE STYLE EXAMPLES",
+             "Below are existing cases in the target section. New cases must match this style."]
+    for i, ex in enumerate(examples, 1):
+        parts.append("")
+        parts.append(f"### Example {i}")
+        parts.append(f"Title: {ex['title']}")
+        if ex.get("preconditions"):
+            parts.append(f"Preconditions: {ex['preconditions']}")
+        parts.append("Steps:")
+        for j, s in enumerate(ex.get("steps", []), 1):
+            parts.append(f"  {j}. {s.get('step','')}")
+            if s.get("expected"):
+                parts.append(f"     Expected: {s['expected']}")
+    parts.append("")
+    return "\n".join(parts) + "\n"
+
+
+def _generate_cases_via_claude(
+    title: str,
+    content: str,
+    section: str,
+    style_examples: list[dict] | None = None,
+) -> list[dict]:
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    style_block = _format_house_style_block(style_examples or [])
     user_prompt = (
         f"Feature: {title}\n"
         f"Section in TestRail: {section}\n\n"
-        f"Specification:\n{content[:12000]}\n\n"
+        f"{style_block}"
+        f"## SPECIFICATION\n{content[:12000]}\n\n"
         "Generate test cases for this feature."
     )
     msg = client.messages.create(
@@ -303,6 +376,29 @@ def _generate_cases_via_claude(title: str, content: str, section: str) -> list[d
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S)
     return json.loads(raw)
+
+
+async def _fetch_house_style_examples(
+    project_id: int,
+    suite_id: int,
+    section_id: int,
+    n: int = 5,
+) -> list[dict]:
+    """Pull up to N existing cases from the target section so AI matches their style."""
+    path = f"get_cases/{project_id}&suite_id={suite_id}&section_id={section_id}&limit={n*4}"
+    data = await _tr_request("GET", path)
+    raw_cases = _unwrap(data, "cases")
+    # Prefer cases that actually have steps + preconditions — they're more useful as templates
+    scored = sorted(
+        raw_cases,
+        key=lambda c: (
+            bool(c.get("custom_steps_separated")),
+            bool(c.get("custom_preconds")),
+            -len(c.get("title") or ""),
+        ),
+        reverse=True,
+    )
+    return [_simplify_case(c) for c in scored[:n] if c.get("title")]
 
 
 def _case_to_testrail_payload(case: dict) -> dict:
@@ -335,8 +431,7 @@ _section_cache: dict[tuple[str, int | None], int] = {}
 
 async def _load_sections(project_id: int, suite_id: int) -> None:
     resp = await _tr_request("GET", f"get_sections/{project_id}&suite_id={suite_id}")
-    sections = resp.get("sections", resp) if isinstance(resp, dict) else resp
-    for s in sections or []:
+    for s in _unwrap(resp, "sections"):
         _section_cache[(s["name"], s.get("parent_id"))] = s["id"]
 
 
@@ -377,8 +472,13 @@ async def _resolve_section(
 async def list_projects() -> list[dict]:
     """List all TestRail projects visible to the configured user."""
     data = await _tr_request("GET", "get_projects")
-    if isinstance(data, dict) and "projects" in data:
-        return data["projects"]
+    return _unwrap(data, "projects")
+
+
+def _unwrap(data: Any, key: str) -> list:
+    """Newer TestRail wraps lists as {'offset':..., key: [...]}; older returns the list directly."""
+    if isinstance(data, dict) and key in data:
+        return data[key] or []
     return data or []
 
 
@@ -391,7 +491,8 @@ async def list_suites(project_id: int | None = None) -> list[dict]:
     pid = project_id or TR_PROJECT_ID
     if not pid:
         raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
-    return await _tr_request("GET", f"get_suites/{pid}") or []
+    data = await _tr_request("GET", f"get_suites/{pid}")
+    return _unwrap(data, "suites")
 
 
 @mcp.tool()
@@ -418,7 +519,7 @@ async def search_test_cases(
         params.append(f"&section_id={section_id}")
     path = f"get_cases/{pid}" + "".join(params)
     data = await _tr_request("GET", path)
-    cases = data.get("cases", data) if isinstance(data, dict) else data
+    cases = _unwrap(data, "cases")
     if title_contains:
         needle = title_contains.lower()
         cases = [c for c in cases if needle in (c.get("title") or "").lower()]
@@ -473,6 +574,31 @@ async def get_or_create_section(
 
 
 @mcp.tool()
+async def preview_house_style(
+    section_id: int | None = None,
+    section_hierarchy: str | None = None,
+    project_id: int | None = None,
+    suite_id: int | None = None,
+    n: int = 5,
+) -> dict:
+    """Return up to N existing cases from the target section in style-example format.
+
+    Use this to preview what Claude will see as "house style" before generating.
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+    if not (pid and sid):
+        raise ValueError("project_id and suite_id required (or set in .env).")
+    target_section_id = section_id
+    if section_hierarchy and not target_section_id:
+        target_section_id = await _resolve_section(pid, sid, section_hierarchy, False)
+    if not target_section_id:
+        raise ValueError("section_id or section_hierarchy required.")
+    examples = await _fetch_house_style_examples(pid, sid, target_section_id, n=n)
+    return {"section_id": target_section_id, "examples": examples}
+
+
+@mcp.tool()
 async def generate_cases_from_text(
     text: str,
     feature_title: str = "Untitled feature",
@@ -480,6 +606,9 @@ async def generate_cases_from_text(
     section_id: int | None = None,
     project_id: int | None = None,
     suite_id: int | None = None,
+    house_style: bool = True,
+    house_style_section_id: int | None = None,
+    house_style_examples: int = 5,
 ) -> dict:
     """Generate TestRail test cases from a free-form spec/PRD/text.
 
@@ -488,22 +617,41 @@ async def generate_cases_from_text(
       - `section_hierarchy` — like `1.5.0 > Tournament Race`; missing nodes are created.
         Uses TESTRAIL_PROJECT_ID/SUITE_ID from env unless overridden.
 
-    Without either, the cases are returned but not created in TestRail.
+    House-style matching:
+      - If `house_style` is True (default) and a target section is known,
+        the server fetches a few existing cases from that section and passes
+        them to Claude as style examples, so new cases match local conventions.
+      - Override the style source with `house_style_section_id` to pull examples
+        from a different "golden" section while writing into another.
 
-    Returns {"cases": [...], "created_ids": [...]}.
+    Without a target section, cases are returned but not created in TestRail.
+
+    Returns {"cases", "created_ids", "section_id", "style_section_id", "style_examples_used"}.
     """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+
+    target_section_id = section_id
+    if section_hierarchy and target_section_id is None and pid and sid:
+        target_section_id = await _resolve_section(pid, sid, section_hierarchy, True)
+
+    style_examples: list[dict] = []
+    style_section_id = house_style_section_id or target_section_id
+    if house_style and style_section_id and pid and sid and house_style_examples > 0:
+        try:
+            style_examples = await _fetch_house_style_examples(
+                pid, sid, style_section_id, n=house_style_examples
+            )
+        except Exception:
+            # Style examples are a nice-to-have; never fail the run because of them.
+            style_examples = []
+
     cases = _generate_cases_via_claude(
         title=feature_title,
         content=text,
         section=section_hierarchy or "ad-hoc",
+        style_examples=style_examples,
     )
-
-    target_section_id = section_id
-    if section_hierarchy and target_section_id is None:
-        pid = project_id or TR_PROJECT_ID
-        sid = suite_id or TR_SUITE_ID
-        if pid and sid:
-            target_section_id = await _resolve_section(pid, sid, section_hierarchy, True)
 
     created_ids: list[int] = []
     if target_section_id is not None:
@@ -517,6 +665,8 @@ async def generate_cases_from_text(
         "cases": cases,
         "created_ids": created_ids,
         "section_id": target_section_id,
+        "style_section_id": style_section_id if style_examples else None,
+        "style_examples_used": len(style_examples),
     }
 
 
@@ -527,10 +677,14 @@ async def generate_cases_from_jira(
     section_id: int | None = None,
     project_id: int | None = None,
     suite_id: int | None = None,
+    house_style: bool = True,
+    house_style_section_id: int | None = None,
+    house_style_examples: int = 5,
 ) -> dict:
     """Fetch a Jira ticket by key, generate test cases, and optionally push them to TestRail.
 
     Example: issue_key="SH-1950", section_hierarchy="1.5.0 > Tournament Race".
+    Set `house_style=False` to skip pulling sibling cases as style anchors.
     """
     issue = await _jira_get_issue(issue_key)
     title, content, version_label = _jira_to_context(issue)
@@ -541,6 +695,9 @@ async def generate_cases_from_jira(
         section_id=section_id,
         project_id=project_id,
         suite_id=suite_id,
+        house_style=house_style,
+        house_style_section_id=house_style_section_id,
+        house_style_examples=house_style_examples,
     )
     result["source"] = {"type": "jira", "key": issue_key, "version": version_label}
     return result
@@ -553,10 +710,14 @@ async def generate_cases_from_confluence(
     section_id: int | None = None,
     project_id: int | None = None,
     suite_id: int | None = None,
+    house_style: bool = True,
+    house_style_section_id: int | None = None,
+    house_style_examples: int = 5,
 ) -> dict:
     """Fetch a Confluence page by ID, generate test cases, and optionally push them to TestRail.
 
     `page_id` is the numeric ID (last part of the page URL: `/wiki/spaces/X/pages/<page_id>`).
+    Set `house_style=False` to skip pulling sibling cases as style anchors.
     """
     title, content, version_label = await _confluence_get_page(page_id)
     result = await generate_cases_from_text(
@@ -566,10 +727,18 @@ async def generate_cases_from_confluence(
         section_id=section_id,
         project_id=project_id,
         suite_id=suite_id,
+        house_style=house_style,
+        house_style_section_id=house_style_section_id,
+        house_style_examples=house_style_examples,
     )
     result["source"] = {"type": "confluence", "page_id": page_id, "version": version_label}
     return result
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point used by `testrail-mcp` script and `uvx testrail-mcp`."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -18,19 +18,28 @@ Built on the official Python MCP SDK ([FastMCP](https://github.com/modelcontextp
 - `generate_cases_from_text` — feed a PRD chunk / spec / bug report → get TestRail-shaped cases, optionally created in the given section (by ID or by hierarchy string)
 - `generate_cases_from_jira` — pass a Jira issue key (e.g. `SH-1950`); server fetches summary, description, comments, subtasks, walks the ADF tree, generates cases
 - `generate_cases_from_confluence` — pass a Confluence page ID; same flow, HTML body stripped to plain text
+- `preview_house_style` — see the 5 sibling cases that will be passed to Claude as in-context style anchors
+
+All three `generate_cases_*` tools pull a few existing cases from the target section and feed them to Claude as house-style examples by default, so new cases match local title casing, step granularity, and expected-result phrasing. Override with `house_style_section_id` to draw style from a different "golden" section, or set `house_style=False` to skip.
 
 ## Quick start
 
+### Run with `uvx` (recommended — no clone, no venv)
+
+Once the package is on PyPI:
+
 ```bash
-git clone https://github.com/<you>/testrail-mcp
+uvx testrail-mcp
+```
+
+For local development from a checkout:
+
+```bash
+git clone https://github.com/Sergey-Bl/testrail-mcp
 cd testrail-mcp
-
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Fill in TESTRAIL_*, JIRA_* (optional), ANTHROPIC_API_KEY
+uv venv --python 3.12
+uv pip install -e .
+cp .env.example .env   # fill in TestRail / Jira / Anthropic keys
 ```
 
 ### Inspect interactively (recommended first step)
@@ -49,8 +58,19 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "testrail": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/testrail-mcp/server.py"]
+      "command": "uvx",
+      "args": ["testrail-mcp"],
+      "env": {
+        "TESTRAIL_BASE_URL": "https://your-org.testrail.io",
+        "TESTRAIL_USER": "you@example.com",
+        "TESTRAIL_API_KEY": "...",
+        "TESTRAIL_PROJECT_ID": "1",
+        "TESTRAIL_SUITE_ID": "1",
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "JIRA_BASE_URL": "https://your-org.atlassian.net",
+        "JIRA_USER": "you@example.com",
+        "JIRA_API_TOKEN": "..."
+      }
     }
   }
 }
@@ -61,8 +81,10 @@ Restart Claude Desktop. The `testrail` server should appear in the tools menu.
 ### Use in Claude Code
 
 ```bash
-claude mcp add testrail -- /absolute/path/to/.venv/bin/python /absolute/path/to/server.py
+claude mcp add testrail -- uvx testrail-mcp
 ```
+
+(You'll still need to provide env vars — either via `claude mcp add --env KEY=VALUE` flags or a `.env` in the working directory.)
 
 ### Use in Cursor
 
@@ -72,8 +94,9 @@ In `~/.cursor/mcp.json`:
 {
   "mcpServers": {
     "testrail": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/server.py"]
+      "command": "uvx",
+      "args": ["testrail-mcp"],
+      "env": { "TESTRAIL_BASE_URL": "...", "TESTRAIL_USER": "...", "TESTRAIL_API_KEY": "...", "ANTHROPIC_API_KEY": "..." }
     }
   }
 }

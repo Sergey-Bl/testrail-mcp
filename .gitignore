@@ -11,3 +11,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+# Local smoke scripts — not part of the public API
+test_all.py
+test_house_style.py
+/tmp/
