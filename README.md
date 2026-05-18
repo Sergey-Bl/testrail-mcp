@@ -12,11 +12,11 @@ Built on the official Python MCP SDK ([FastMCP](https://github.com/modelcontextp
 - `search_test_cases` — list cases under a project / suite / section, optionally filter by title substring
 - `get_test_case` — fetch one case by ID
 - `create_test_case` — create a case in a section
-- `get_or_create_section` — resolve a path like `1.5.0 > Tournament Race > Edge Cases`, creating missing nodes
+- `get_or_create_section` — resolve a path like `Auth > Login > Edge Cases`, creating missing nodes
 
 **AI tools (the actual differentiator)**
 - `generate_cases_from_text` — feed a PRD chunk / spec / bug report → get TestRail-shaped cases, optionally created in the given section (by ID or by hierarchy string)
-- `generate_cases_from_jira` — pass a Jira issue key (e.g. `SH-1950`); server fetches summary, description, comments, subtasks, walks the ADF tree, generates cases
+- `generate_cases_from_jira` — pass a Jira issue key (e.g. `ABC-123`); server fetches summary, description, comments, subtasks, walks the ADF tree, generates cases
 - `generate_cases_from_confluence` — pass a Confluence page ID; same flow, HTML body stripped to plain text
 - `preview_house_style` — see the 5 sibling cases that will be passed to Claude as in-context style anchors
 
@@ -127,17 +127,26 @@ In `~/.cursor/mcp.json`:
 
 In Claude Code or Claude Desktop, after the server is registered:
 
-> Generate test cases from `SH-1950` and put them under `1.5.0 > Tournament Race > Smoke`.
+> Generate test cases from `ABC-123` and put them under `Auth > Login > Smoke`.
 
 The server walks the section path (creating missing nodes), pulls the Jira ticket, generates ~15-30 cases, then bulk-creates them with house-style defaults (template 2, type 7, priority 3). Reply contains every new case ID.
 
+## Tool reference
+
+In addition to the basics above:
+
+- `bootstrap_feature` — one-shot pipeline: ingest a Confluence page / Jira ticket / raw spec, generate cases with house-style anchors, run lint + coverage-gap analysis, optionally dedupe against an existing section, push to TestRail. `push=False` for dry-run.
+- `dedupe_against_section` — flag generated cases that look like duplicates of cases already in a target section (title-token overlap; configurable `threshold`).
+- `lint_cases` — Claude reviews a batch of cases and flags vague titles, generic "should work" expecteds, combined steps, missing preconditions, etc.
+- `coverage_gaps` — Claude compares the original spec to the generated case set and lists testable behaviours that aren't covered.
+- `list_sections`, `find_populated_section`, `create_suite` — small CRUD helpers used by the orchestrator.
+
 ## Roadmap
 
-- [ ] House-style prompt: pull a few sibling cases from the target section to steer style consistency
-- [ ] `lint_section` — flag duplicates, vague expecteds, missing preconditions
-- [ ] Confluence ingest (`generate_cases_from_confluence`)
-- [ ] `suggest_missing_coverage` — gap analysis against an existing section
-- [ ] SSE transport for hosted use
+- [ ] SSE / HTTP transport for hosted use
+- [ ] Embedding-based dedupe (semantic, not just token overlap)
+- [ ] `update_case` — patch existing cases when the spec changes
+- [ ] Suite cloning across projects
 
 ## License
 

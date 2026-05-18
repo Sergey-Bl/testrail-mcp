@@ -5,7 +5,7 @@ free-form text, a Jira ticket, or a Confluence page — and optionally push them
 into TestRail in one call.
 
 Prompt, ADF parser, section-hierarchy logic and house-style defaults are
-ported from the battle-tested qa_bot.py used in the Travel Sort QA workflow.
+ported from a battle-tested Slack-bot version of the same prompt and helpers.
 
 Run locally via stdio:
     python server.py
@@ -50,7 +50,7 @@ CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", JIRA_API_TOKEN)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GEN_MODEL = os.getenv("CASE_GEN_MODEL", "claude-haiku-4-5-20251001")
 
-# TestRail defaults — match qa_bot.py house style
+# TestRail defaults — match the original Slack-bot prototype house style
 TR_TEMPLATE_ID = int(os.getenv("TR_TEMPLATE_ID", "2"))   # "Test Case (Steps)"
 TR_TYPE_ID = int(os.getenv("TR_TYPE_ID", "7"))           # adjust to your TR types
 TR_PRIORITY_ID = int(os.getenv("TR_PRIORITY_ID", "3"))   # Medium
@@ -143,7 +143,7 @@ async def _confluence_get_page(page_id: str) -> tuple[str, str, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Atlassian Document Format → plain text (ported from qa_bot.py)
+# Atlassian Document Format → plain text (ported from the original Slack-bot prototype)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -260,7 +260,7 @@ def _jira_to_context(issue: dict) -> tuple[str, str, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Case-generation prompt — ported verbatim from qa_bot.py
+# Case-generation prompt — ported verbatim from the original Slack-bot prototype
 # ──────────────────────────────────────────────────────────────────────
 
 CASE_GEN_SYSTEM = """You are a QA engineer. Given a feature specification or Jira issue, generate test cases.
@@ -372,6 +372,43 @@ def _generate_cases_via_claude(
         max_tokens=8000,
         system=CASE_GEN_SYSTEM,
         messages=[{"role": "user", "content": user_prompt}],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S)
+    return json.loads(raw)
+
+
+def _normalize_title(t: str) -> str:
+    """Lowercase, strip non-alphanumeric for fuzzy title matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+_TITLE_STOPWORDS = {"the", "a", "an", "of", "for", "in", "on", "and", "or", "to"}
+
+
+def _title_overlap(a: str, b: str) -> float:
+    """Token-containment ratio: shared tokens / smaller side. Returns 1.0 when one
+    title is a token-subset of the other — i.e. the case is plausibly the same."""
+    sa = set(_normalize_title(a).split()) - _TITLE_STOPWORDS
+    sb = set(_normalize_title(b).split()) - _TITLE_STOPWORDS
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+async def _existing_titles_in_section(project_id: int, suite_id: int, section_id: int) -> list[dict]:
+    """All cases currently in a section, simplified to {id, title}."""
+    path = f"get_cases/{project_id}&suite_id={suite_id}&section_id={section_id}&limit=250"
+    data = await _tr_request("GET", path)
+    return [{"id": c["id"], "title": c.get("title", "")} for c in _unwrap(data, "cases")]
+
+
+async def _claude_json(system: str, user: str, max_tokens: int = 4000) -> Any:
+    """Minimal helper for one-shot Claude calls that should return JSON."""
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=GEN_MODEL, max_tokens=max_tokens, system=system,
+        messages=[{"role": "user", "content": user}],
     )
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S)
@@ -619,7 +656,7 @@ async def get_or_create_section(
     project_id: int | None = None,
     suite_id: int | None = None,
 ) -> dict:
-    """Resolve a section hierarchy like `1.5.0 > Tournament Race > Edge Cases`,
+    """Resolve a section hierarchy like `Auth > Login > Edge Cases`,
     creating missing parents as needed. Returns {"section_id": int, "path": str}.
 
     Defaults to TESTRAIL_PROJECT_ID / TESTRAIL_SUITE_ID from env when not provided.
@@ -680,7 +717,7 @@ async def generate_cases_from_text(
 
     Targeting modes (pick one when you want them created):
       - `section_id` — push straight into an existing section ID
-      - `section_hierarchy` — like `1.5.0 > Tournament Race`; missing nodes are created.
+      - `section_hierarchy` — like `Auth > Login`; missing nodes are created.
         Uses TESTRAIL_PROJECT_ID/SUITE_ID from env unless overridden.
 
     House-style matching:
@@ -749,7 +786,7 @@ async def generate_cases_from_jira(
 ) -> dict:
     """Fetch a Jira ticket by key, generate test cases, and optionally push them to TestRail.
 
-    Example: issue_key="SH-1950", section_hierarchy="1.5.0 > Tournament Race".
+    Example: issue_key="ABC-123", section_hierarchy="Auth > Login".
     Set `house_style=False` to skip pulling sibling cases as style anchors.
     """
     issue = await _jira_get_issue(issue_key)
@@ -802,6 +839,157 @@ async def generate_cases_from_confluence(
 
 
 @mcp.tool()
+async def dedupe_against_section(
+    cases: list[dict],
+    section_id: int,
+    project_id: int | None = None,
+    suite_id: int | None = None,
+    threshold: float = 0.65,
+) -> dict:
+    """Check generated cases against what's already in a TestRail section.
+
+    Uses title-token overlap (no embeddings) — fast, deterministic. Returns:
+      - `kept`: list of {case, reason} that look new
+      - `duplicates`: list of {case, existing_id, existing_title, overlap}
+    `threshold` is the minimum token-overlap (0..1) to flag as duplicate.
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+    if not (pid and sid):
+        raise ValueError("project_id and suite_id required (or set in .env).")
+    existing = await _existing_titles_in_section(pid, sid, section_id)
+
+    kept: list[dict] = []
+    duplicates: list[dict] = []
+    for c in cases:
+        title = c.get("title", "")
+        best = None
+        best_score = 0.0
+        for e in existing:
+            score = _title_overlap(title, e["title"])
+            if score > best_score:
+                best_score = score
+                best = e
+        if best and best_score >= threshold:
+            duplicates.append({
+                "case": c,
+                "existing_id": best["id"],
+                "existing_title": best["title"],
+                "overlap": round(best_score, 2),
+            })
+        else:
+            kept.append({"case": c, "closest_existing": best, "max_overlap": round(best_score, 2)})
+
+    return {
+        "kept": kept,
+        "duplicates": duplicates,
+        "kept_count": len(kept),
+        "duplicates_count": len(duplicates),
+        "section_id": section_id,
+        "section_total_existing": len(existing),
+    }
+
+
+LINT_SYSTEM = """You are a senior QA lead reviewing test cases for a TestRail project.
+Output ONLY valid JSON, no markdown.
+
+For each case index, flag concrete quality issues. Return:
+[
+  {"index": 0, "warnings": ["vague title", "expected too generic on step 2"]},
+  ...
+]
+
+Only include indexes that have warnings. Skip well-written cases.
+Be terse — each warning under 12 words, actionable.
+
+Common issues to flag:
+- vague or generic titles ("Test feature works")
+- missing or empty preconditions where the test obviously needs setup
+- 'expected' results that say "should work" / "no errors" instead of observable state
+- steps that combine multiple actions into one
+- redundant cases that duplicate another in the same batch
+- missing negative or edge cases for an obvious risk in the feature"""
+
+
+@mcp.tool()
+async def lint_cases(cases: list[dict], feature_title: str = "") -> dict:
+    """Run a QA-quality lint over generated cases via Claude.
+
+    Returns {"warnings": [{"index", "title", "warnings": [...]}], "warning_count"}.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
+    if not cases:
+        return {"warnings": [], "warning_count": 0}
+    payload = []
+    for i, c in enumerate(cases):
+        payload.append({
+            "index": i,
+            "title": c.get("title", ""),
+            "preconditions": c.get("preconditions", ""),
+            "steps": c.get("steps", []),
+        })
+    user = (
+        f"Feature: {feature_title or '(unspecified)'}\n\n"
+        f"Cases to review (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+    raw_warnings = await _claude_json(LINT_SYSTEM, user, max_tokens=4000)
+    warnings = []
+    for w in raw_warnings:
+        idx = w.get("index")
+        if idx is None or idx >= len(cases):
+            continue
+        warnings.append({
+            "index": idx,
+            "title": cases[idx].get("title", ""),
+            "warnings": w.get("warnings", []),
+        })
+    return {"warnings": warnings, "warning_count": len(warnings)}
+
+
+COVERAGE_SYSTEM = """You are a QA architect. Given a feature spec and a list of test
+case titles generated from it, identify what testable behaviour from the spec is
+NOT covered by any case.
+
+Output ONLY valid JSON:
+{
+  "gaps": ["short description of an uncovered behaviour", ...],
+  "weak_areas": ["aspect that has only shallow coverage", ...]
+}
+
+Rules:
+- 'gaps' must be concrete behaviours mentioned (or strongly implied) by the spec.
+- Do not invent requirements that are not in the spec.
+- Each gap under 20 words, written as a testable behaviour.
+- If the spec is fully covered, return {"gaps": [], "weak_areas": []}.
+- Maximum 10 gaps + 5 weak_areas."""
+
+
+@mcp.tool()
+async def coverage_gaps(
+    spec_text: str,
+    cases: list[dict],
+    feature_title: str = "",
+) -> dict:
+    """Use Claude to find behaviours in the spec that are not covered by the case set."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
+    titles = [c.get("title", "") for c in cases]
+    user = (
+        f"Feature: {feature_title or '(unspecified)'}\n\n"
+        f"## SPEC\n{spec_text[:12000]}\n\n"
+        f"## EXISTING CASE TITLES ({len(titles)})\n"
+        + "\n".join(f"- {t}" for t in titles)
+    )
+    result = await _claude_json(COVERAGE_SYSTEM, user, max_tokens=2000)
+    return {
+        "gaps": result.get("gaps", []),
+        "weak_areas": result.get("weak_areas", []),
+        "gaps_count": len(result.get("gaps", [])),
+    }
+
+
+@mcp.tool()
 async def bootstrap_feature(
     source_type: str,
     source_value: str,
@@ -811,6 +999,10 @@ async def bootstrap_feature(
     section_name: str = "General",
     style_from_suite_id: int | None = None,
     push: bool = False,
+    dedupe: bool = True,
+    lint: bool = True,
+    find_gaps: bool = True,
+    dedupe_threshold: float = 0.65,
 ) -> dict:
     """One-shot pipeline: ingest a feature spec, set up TestRail structure, generate cases, push.
 
@@ -890,30 +1082,72 @@ async def bootstrap_feature(
     report["cases"] = cases
     report["cases_count"] = len(cases)
 
+    # 4. Lint + coverage-gap analysis (non-blocking, advisory)
+    if lint:
+        try:
+            report["lint"] = await lint_cases(cases, feature_title=title)
+        except Exception as e:
+            report["lint"] = {"error": str(e)}
+    if find_gaps:
+        try:
+            report["coverage"] = await coverage_gaps(
+                spec_text=content, cases=cases, feature_title=title
+            )
+        except Exception as e:
+            report["coverage"] = {"error": str(e)}
+
+    # 5. Resolve target suite (create new OR use existing) — needed for dedupe and push
+    if push or (dedupe and existing_suite_id):
+        if new_suite_name:
+            if push:
+                suite = await create_suite(
+                    name=new_suite_name,
+                    description=f"Generated via testrail-mcp bootstrap_feature from {report['source']}",
+                    project_id=pid,
+                )
+                suite_id = suite["id"]
+                report["suite"] = {"id": suite_id, "name": new_suite_name, "created": True}
+            else:
+                suite_id = None
+                report["suite"] = {"name": new_suite_name, "created": False, "would_create_on_push": True}
+        else:
+            suite_id = existing_suite_id
+            report["suite"] = {"id": suite_id, "created": False}
+    else:
+        suite_id = None
+        report["suite"] = None
+
+    # 6. Dedupe vs existing section content (only meaningful if target section exists)
+    if dedupe and suite_id and existing_suite_id:
+        # Resolve section without creating, only to check duplicates against an existing target
+        try:
+            existing_section_id = await _resolve_section(
+                pid, suite_id, section_name, create_missing=False
+            )
+            dd = await dedupe_against_section(
+                cases=cases, section_id=existing_section_id,
+                project_id=pid, suite_id=suite_id, threshold=dedupe_threshold,
+            )
+            report["dedupe"] = {
+                "duplicates_count": dd["duplicates_count"],
+                "duplicates": dd["duplicates"],
+                "kept_count": dd["kept_count"],
+            }
+            cases = [item["case"] for item in dd["kept"]]
+        except Exception as e:
+            report["dedupe"] = {"skipped_reason": str(e)}
+
     if not push:
         report["dry_run"] = True
         report["note"] = "No TestRail writes performed. Re-run with push=True to commit."
         return report
 
-    # 4. Create or reuse suite
-    if new_suite_name:
-        suite = await create_suite(
-            name=new_suite_name,
-            description=f"Generated via testrail-mcp bootstrap_feature from {report['source']}",
-            project_id=pid,
-        )
-        suite_id = suite["id"]
-        report["suite"] = {"id": suite_id, "name": new_suite_name, "created": True}
-    else:
-        suite_id = existing_suite_id
-        report["suite"] = {"id": suite_id, "created": False}
-
-    # 5. Create section (hierarchy supported)
+    # 7. Create section (hierarchy supported)
     _section_cache.clear()
     section_id = await _resolve_section(pid, suite_id, section_name, create_missing=True)
     report["section"] = {"id": section_id, "path": section_name}
 
-    # 6. Push cases
+    # 8. Push remaining (post-dedupe) cases
     created: list[dict] = []
     failed: list[dict] = []
     for c in cases:
