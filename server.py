@@ -383,26 +383,40 @@ async def list_projects() -> list[dict]:
 
 
 @mcp.tool()
-async def list_suites(project_id: int) -> list[dict]:
-    """List suites under a given TestRail project."""
-    return await _tr_request("GET", f"get_suites/{project_id}") or []
+async def list_suites(project_id: int | None = None) -> list[dict]:
+    """List suites under a TestRail project.
+
+    `project_id` defaults to TESTRAIL_PROJECT_ID from env when omitted or 0.
+    """
+    pid = project_id or TR_PROJECT_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    return await _tr_request("GET", f"get_suites/{pid}") or []
 
 
 @mcp.tool()
 async def search_test_cases(
-    project_id: int,
+    project_id: int | None = None,
     suite_id: int | None = None,
     section_id: int | None = None,
     title_contains: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """List test cases in a project, optionally filtered by suite, section, or title substring."""
+    """List test cases in a project, optionally filtered by suite, section, or title substring.
+
+    Both `project_id` and `suite_id` fall back to env defaults
+    (TESTRAIL_PROJECT_ID / TESTRAIL_SUITE_ID) when omitted or 0.
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id if suite_id is not None and suite_id != 0 else (TR_SUITE_ID or None)
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
     params: list[str] = []
-    if suite_id is not None:
-        params.append(f"&suite_id={suite_id}")
-    if section_id is not None:
+    if sid is not None:
+        params.append(f"&suite_id={sid}")
+    if section_id is not None and section_id != 0:
         params.append(f"&section_id={section_id}")
-    path = f"get_cases/{project_id}" + "".join(params)
+    path = f"get_cases/{pid}" + "".join(params)
     data = await _tr_request("GET", path)
     cases = data.get("cases", data) if isinstance(data, dict) else data
     if title_contains:
