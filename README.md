@@ -135,11 +135,20 @@ The server walks the section path (creating missing nodes), pulls the Jira ticke
 
 In addition to the basics above:
 
+**Test-case authoring & QA**
 - `bootstrap_feature` — one-shot pipeline: ingest a Confluence page / Jira ticket / raw spec, generate cases with house-style anchors, run lint + coverage-gap analysis, optionally dedupe against an existing section, push to TestRail. `push=False` for dry-run.
 - `dedupe_against_section` — flag generated cases that look like duplicates of cases already in a target section (title-token overlap; configurable `threshold`).
 - `lint_cases` — Claude reviews a batch of cases and flags vague titles, generic "should work" expecteds, combined steps, missing preconditions, etc.
 - `coverage_gaps` — Claude compares the original spec to the generated case set and lists testable behaviours that aren't covered.
-- `list_sections`, `find_populated_section`, `create_suite` — small CRUD helpers used by the orchestrator.
+- `list_sections`, `find_populated_section`, `create_suite`, `update_case` — CRUD helpers.
+
+**Test-run management & reporting**
+- `list_runs`, `get_run`, `get_tests_in_run`, `get_results_for_run` — read-side access.
+- `create_run`, `update_run`, `close_run` — write-side. Pair with CI to auto-create a run per build.
+- `add_result`, `add_bulk_results` — post results back from automation. Status accepts either a string (`"passed"`, `"failed"`, `"blocked"`, `"retest"`) or a TestRail status_id.
+- `summarize_run` — Claude generates a ship-ready Markdown report (executive summary, top failures, risk areas, verdict).
+- `compare_runs(run_a, run_b)` — regression/fix delta between two runs, narrated as Markdown.
+- `flaky_test_detector(case_id, last_n_runs)` — pull a case's status across recent runs and flag flakiness when it flips between pass/fail.
 
 ## Roadmap
 

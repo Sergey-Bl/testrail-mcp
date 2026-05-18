@@ -15,6 +15,7 @@ Or inspect interactively:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -986,6 +987,532 @@ async def coverage_gaps(
         "gaps": result.get("gaps", []),
         "weak_areas": result.get("weak_areas", []),
         "gaps_count": len(result.get("gaps", [])),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Test-run reporting
+# ──────────────────────────────────────────────────────────────────────
+
+# TestRail's default status_id meanings:
+TR_STATUS = {
+    1: "passed",
+    2: "blocked",
+    3: "untested",
+    4: "retest",
+    5: "failed",
+}
+
+
+@mcp.tool()
+async def list_runs(
+    project_id: int | None = None,
+    suite_id: int | None = None,
+    is_completed: bool | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List test runs in a project.
+
+    Filters:
+      - `suite_id` — only runs of this suite
+      - `is_completed` — True for closed/archived runs only, False for open only
+    """
+    pid = project_id or TR_PROJECT_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    params = []
+    if suite_id is not None and suite_id != 0:
+        params.append(f"&suite_id={suite_id}")
+    if is_completed is not None:
+        params.append(f"&is_completed={1 if is_completed else 0}")
+    params.append(f"&limit={min(limit, 250)}")
+    data = await _tr_request("GET", f"get_runs/{pid}" + "".join(params))
+    runs = _unwrap(data, "runs")
+    # Trim heavy fields users rarely need
+    return [{
+        "id": r["id"],
+        "name": r.get("name"),
+        "suite_id": r.get("suite_id"),
+        "is_completed": r.get("is_completed", False),
+        "created_on": r.get("created_on"),
+        "completed_on": r.get("completed_on"),
+        "passed_count": r.get("passed_count", 0),
+        "failed_count": r.get("failed_count", 0),
+        "blocked_count": r.get("blocked_count", 0),
+        "retest_count": r.get("retest_count", 0),
+        "untested_count": r.get("untested_count", 0),
+        "url": r.get("url"),
+    } for r in runs[:limit]]
+
+
+@mcp.tool()
+async def get_run(run_id: int) -> dict:
+    """Fetch the full metadata of a single test run."""
+    return await _tr_request("GET", f"get_run/{run_id}")
+
+
+@mcp.tool()
+async def get_tests_in_run(run_id: int, limit: int = 250) -> list[dict]:
+    """Tests in a run with their current status (current = latest result)."""
+    data = await _tr_request("GET", f"get_tests/{run_id}&limit={min(limit, 250)}")
+    tests = _unwrap(data, "tests")
+    return [{
+        "id": t["id"],
+        "case_id": t.get("case_id"),
+        "title": t.get("title"),
+        "status_id": t.get("status_id"),
+        "status": TR_STATUS.get(t.get("status_id"), "unknown"),
+        "assignedto_id": t.get("assignedto_id"),
+        "priority_id": t.get("priority_id"),
+    } for t in tests[:limit]]
+
+
+@mcp.tool()
+async def get_results_for_run(run_id: int, limit: int = 250) -> list[dict]:
+    """All result entries for a run — includes comments, defects, who tested when."""
+    data = await _tr_request("GET", f"get_results_for_run/{run_id}&limit={min(limit, 250)}")
+    results = _unwrap(data, "results")
+    return [{
+        "id": r["id"],
+        "test_id": r.get("test_id"),
+        "status_id": r.get("status_id"),
+        "status": TR_STATUS.get(r.get("status_id"), "unknown"),
+        "comment": _clean_richtext(r.get("comment", "") or ""),
+        "defects": r.get("defects"),
+        "created_on": r.get("created_on"),
+        "created_by": r.get("created_by"),
+        "elapsed": r.get("elapsed"),
+    } for r in results[:limit]]
+
+
+SUMMARIZE_RUN_SYSTEM = """You are a senior QA lead writing a release-readiness
+status report from a TestRail test run. Output GitHub-flavoured Markdown.
+
+Structure (use these section headings exactly):
+
+## Summary
+One short paragraph (3-4 sentences) for non-QA stakeholders: what was tested,
+pass rate, ship-readiness verdict.
+
+## Stats
+A compact table of counts: Passed / Failed / Blocked / Retest / Untested,
+plus pass rate percentage of executed tests.
+
+## Top failures
+Up to 8 most concerning failures. Group by area or root cause when obvious.
+For each, give:
+- The test title (verbatim)
+- One-line hypothesis of what's broken, drawn from the tester comment
+
+## Risk areas
+2-5 short bullets calling out: clusters of failures in a feature, low coverage
+visible in the breakdown, blocked tests that hide real signal, anything a
+release manager should know.
+
+## Recommendation
+One of: **READY**, **NEEDS ATTENTION**, **BLOCKED** — followed by one short
+paragraph explaining why and what unblocks the next decision.
+
+Rules:
+- Be concrete. Cite test names. No filler.
+- Do not invent counts or test names — use only what the input contains.
+- If untested ratio > 30%, call it out as a "coverage gap" risk.
+- If the same test appears repeatedly across runs (you won't see this — only
+  current run is provided), flag it as "potentially flaky — verify across runs"."""
+
+
+@mcp.tool()
+async def summarize_run(
+    run_id: int,
+    include_passed_titles: bool = False,
+) -> dict:
+    """Generate a human-readable Markdown report for a test run.
+
+    Pulls run metadata, current per-test statuses, and per-failure comments,
+    then asks Claude to synthesise a release-readiness report.
+
+    `include_passed_titles=False` (default) keeps the prompt compact — Claude
+    sees only failure/blocked/retest details plus aggregate pass counts. Set
+    True only for tiny runs (<50 tests) when you want full granularity.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
+
+    run = await get_run(run_id)
+    tests = await get_tests_in_run(run_id, limit=500)
+    results = await get_results_for_run(run_id, limit=500)
+
+    # Index latest result per test
+    latest_by_test: dict[int, dict] = {}
+    for r in results:
+        tid = r.get("test_id")
+        if not tid:
+            continue
+        if tid not in latest_by_test:
+            latest_by_test[tid] = r
+
+    # Bucket tests by status
+    buckets: dict[str, list[dict]] = {k: [] for k in TR_STATUS.values()}
+    for t in tests:
+        bucket = TR_STATUS.get(t["status_id"], "unknown")
+        latest = latest_by_test.get(t["id"], {})
+        buckets.setdefault(bucket, []).append({
+            "title": t["title"],
+            "comment": (latest.get("comment") or "")[:600],
+        })
+
+    counts = {k: len(v) for k, v in buckets.items()}
+    executed = counts.get("passed", 0) + counts.get("failed", 0) + counts.get("blocked", 0) + counts.get("retest", 0)
+    pass_rate = (counts.get("passed", 0) / executed * 100) if executed else 0.0
+
+    # Build compact input
+    payload = {
+        "run": {
+            "id": run.get("id"),
+            "name": run.get("name"),
+            "description": (run.get("description") or "")[:400],
+            "is_completed": run.get("is_completed", False),
+            "created_on": run.get("created_on"),
+            "completed_on": run.get("completed_on"),
+        },
+        "counts": counts,
+        "executed": executed,
+        "pass_rate_pct": round(pass_rate, 1),
+        "failed": buckets.get("failed", [])[:50],
+        "blocked": buckets.get("blocked", [])[:25],
+        "retest": buckets.get("retest", [])[:25],
+        "untested_count": counts.get("untested", 0),
+    }
+    if include_passed_titles:
+        payload["passed_titles"] = [t["title"] for t in buckets.get("passed", [])[:200]]
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=GEN_MODEL,
+        max_tokens=4000,
+        system=SUMMARIZE_RUN_SYSTEM,
+        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+    )
+    markdown = msg.content[0].text.strip()
+
+    return {
+        "run_id": run_id,
+        "run_name": run.get("name"),
+        "counts": counts,
+        "pass_rate_pct": payload["pass_rate_pct"],
+        "report_markdown": markdown,
+    }
+
+
+@mcp.tool()
+async def create_run(
+    name: str,
+    suite_id: int | None = None,
+    description: str = "",
+    include_all: bool = True,
+    case_ids: list[int] | None = None,
+    milestone_id: int | None = None,
+    project_id: int | None = None,
+    refs: str | None = None,
+) -> dict:
+    """Create a new test run.
+
+    By default includes every case in the suite (`include_all=True`). Pass an
+    explicit `case_ids` list and set `include_all=False` to scope the run.
+    """
+    pid = project_id or TR_PROJECT_ID
+    sid = suite_id or TR_SUITE_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    payload: dict[str, Any] = {"name": name, "include_all": include_all}
+    if sid:
+        payload["suite_id"] = sid
+    if description:
+        payload["description"] = description
+    if not include_all and case_ids:
+        payload["case_ids"] = case_ids
+        payload["include_all"] = False
+    if milestone_id:
+        payload["milestone_id"] = milestone_id
+    if refs:
+        payload["refs"] = refs
+    return await _tr_request("POST", f"add_run/{pid}", json=payload)
+
+
+@mcp.tool()
+async def update_run(
+    run_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    milestone_id: int | None = None,
+    refs: str | None = None,
+) -> dict:
+    """Patch an existing test run's metadata. Pass only fields you want to change."""
+    payload: dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if milestone_id is not None:
+        payload["milestone_id"] = milestone_id
+    if refs is not None:
+        payload["refs"] = refs
+    if not payload:
+        raise ValueError("Pass at least one field to update.")
+    return await _tr_request("POST", f"update_run/{run_id}", json=payload)
+
+
+@mcp.tool()
+async def close_run(run_id: int) -> dict:
+    """Mark a test run as completed/archived. This is irreversible in TestRail."""
+    return await _tr_request("POST", f"close_run/{run_id}", json={})
+
+
+# Inverse of TR_STATUS for accepting strings in add_result tools
+_STATUS_TO_ID = {v: k for k, v in TR_STATUS.items()}
+
+
+def _resolve_status(status: int | str) -> int:
+    if isinstance(status, int):
+        return status
+    s = (status or "").strip().lower()
+    if s in _STATUS_TO_ID:
+        return _STATUS_TO_ID[s]
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(
+            f"Unknown status {status!r}. Use one of "
+            f"{sorted(_STATUS_TO_ID)} or a numeric status_id."
+        )
+
+
+@mcp.tool()
+async def add_result(
+    run_id: int,
+    case_id: int,
+    status: int | str,
+    comment: str = "",
+    defects: str | None = None,
+    elapsed: str | None = None,
+    version: str | None = None,
+) -> dict:
+    """Post a single test result by case_id (TestRail looks up the test inside the run).
+
+    `status` accepts a string ("passed" | "failed" | "blocked" | "retest" | "untested")
+    or a raw TestRail status_id (1..5 by default).
+    `elapsed` is a TestRail time string ("30s", "1m 30s", "1h 5m").
+    `defects` is a comma-separated list of bug-tracker IDs ("BUG-1, BUG-2").
+    """
+    payload: dict[str, Any] = {"status_id": _resolve_status(status)}
+    if comment:
+        payload["comment"] = comment
+    if defects:
+        payload["defects"] = defects
+    if elapsed:
+        payload["elapsed"] = elapsed
+    if version:
+        payload["version"] = version
+    return await _tr_request("POST", f"add_result_for_case/{run_id}/{case_id}", json=payload)
+
+
+@mcp.tool()
+async def add_bulk_results(
+    run_id: int,
+    results: list[dict],
+) -> dict:
+    """Post many results in one TestRail call (much faster than looping add_result).
+
+    Each entry in `results` must have at least `case_id` and `status` (string or id).
+    Optional per-entry fields: comment, defects, elapsed, version, assignedto_id.
+    """
+    if not results:
+        raise ValueError("results list is empty.")
+    payload_results: list[dict] = []
+    for r in results:
+        case_id = r.get("case_id")
+        if not case_id:
+            raise ValueError(f"Each result needs a case_id: {r}")
+        entry: dict[str, Any] = {
+            "case_id": case_id,
+            "status_id": _resolve_status(r.get("status") or r.get("status_id")),
+        }
+        for k in ("comment", "defects", "elapsed", "version", "assignedto_id"):
+            if r.get(k) is not None:
+                entry[k] = r[k]
+        payload_results.append(entry)
+    return await _tr_request(
+        "POST", f"add_results_for_cases/{run_id}",
+        json={"results": payload_results},
+    )
+
+
+@mcp.tool()
+async def update_case(case_id: int, fields: dict) -> dict:
+    """Patch an existing test case. `fields` is forwarded to TestRail as-is.
+
+    Common keys: title, custom_preconds, custom_steps_separated, priority_id, type_id,
+    refs. To rewrite steps, pass a list under custom_steps_separated:
+    [{"content": "...", "expected": "..."}, ...].
+    """
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("`fields` must be a non-empty dict of TestRail case fields.")
+    # If steps come in our AI shape ({step, expected}), translate to TestRail shape
+    if "steps" in fields and "custom_steps_separated" not in fields:
+        fields["custom_steps_separated"] = [
+            {"content": s.get("step") or s.get("content", ""),
+             "expected": s.get("expected", "")}
+            for s in fields.pop("steps")
+        ]
+    return await _tr_request("POST", f"update_case/{case_id}", json=fields)
+
+
+COMPARE_RUNS_SYSTEM = """You compare two TestRail runs and write a regression
+delta report in GitHub-flavoured Markdown. Output ONLY the report, no preamble.
+
+Structure (exact headings):
+
+## Headline
+One sentence: did things get better or worse, and by how much.
+
+## Regressions (was passing → now failing)
+Bullet list, test title + one-line hypothesis if a comment hints at the cause.
+Skip this section entirely (drop the heading) if empty.
+
+## Fixed (was failing → now passing)
+Bullet list of test titles.
+
+## Newly tested
+Tests that exist in B but not A.
+
+## No longer covered
+Tests that exist in A but not B.
+
+## Verdict
+**BETTER** / **WORSE** / **MIXED** — and one short paragraph why.
+
+Rules:
+- Cite test titles verbatim. No invented data.
+- Order regressions by perceived severity (the worse-sounding comments first).
+- Be terse — bullets, not paragraphs."""
+
+
+@mcp.tool()
+async def compare_runs(run_id_a: int, run_id_b: int) -> dict:
+    """Diff two runs (A = older/baseline, B = newer) and ask Claude for a narrative.
+
+    Returns the raw status delta plus a Markdown report.
+    """
+    tests_a, tests_b = await asyncio.gather(
+        get_tests_in_run(run_id_a, limit=500),
+        get_tests_in_run(run_id_b, limit=500),
+    )
+    results_b = await get_results_for_run(run_id_b, limit=500)
+    latest_b_by_test = {}
+    for r in results_b:
+        tid = r.get("test_id")
+        if tid and tid not in latest_b_by_test:
+            latest_b_by_test[tid] = r
+
+    by_case_a = {t["case_id"]: t for t in tests_a if t.get("case_id")}
+    by_case_b = {t["case_id"]: t for t in tests_b if t.get("case_id")}
+
+    regressions, fixes, new_in_b, gone_in_b = [], [], [], []
+    for cid, ta in by_case_a.items():
+        tb = by_case_b.get(cid)
+        if not tb:
+            gone_in_b.append({"title": ta["title"]})
+            continue
+        sa, sb = ta["status"], tb["status"]
+        if sa == "passed" and sb == "failed":
+            comment = (latest_b_by_test.get(tb["id"], {}).get("comment") or "")[:400]
+            regressions.append({"title": tb["title"], "comment": comment})
+        elif sa == "failed" and sb == "passed":
+            fixes.append({"title": tb["title"]})
+    for cid, tb in by_case_b.items():
+        if cid not in by_case_a:
+            new_in_b.append({"title": tb["title"]})
+
+    delta = {
+        "run_a": run_id_a,
+        "run_b": run_id_b,
+        "regressions": regressions,
+        "fixes": fixes,
+        "new_in_b": new_in_b,
+        "gone_in_b": gone_in_b,
+        "counts": {
+            "regressions": len(regressions),
+            "fixes": len(fixes),
+            "new_in_b": len(new_in_b),
+            "gone_in_b": len(gone_in_b),
+        },
+    }
+
+    if not ANTHROPIC_API_KEY:
+        return delta
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=GEN_MODEL,
+        max_tokens=3000,
+        system=COMPARE_RUNS_SYSTEM,
+        messages=[{"role": "user", "content": json.dumps(delta, ensure_ascii=False)}],
+    )
+    delta["report_markdown"] = msg.content[0].text.strip()
+    return delta
+
+
+@mcp.tool()
+async def flaky_test_detector(
+    case_id: int,
+    project_id: int | None = None,
+    last_n_runs: int = 10,
+) -> dict:
+    """Pull this case's result across the last N runs and flag flakiness.
+
+    A test is "flaky" if it has BOTH passes and failures in the window AND
+    flips between them at least twice. Returns the run-by-run trace.
+    """
+    pid = project_id or TR_PROJECT_ID
+    if not pid:
+        raise ValueError("project_id required (or set TESTRAIL_PROJECT_ID in .env).")
+    runs_data = await _tr_request("GET", f"get_runs/{pid}&limit={min(last_n_runs * 5, 250)}")
+    runs = _unwrap(runs_data, "runs")[: max(last_n_runs * 5, last_n_runs)]
+    trace: list[dict] = []
+    for run in runs:
+        if len(trace) >= last_n_runs:
+            break
+        # find test for this case in this run
+        tests = await get_tests_in_run(run["id"], limit=500)
+        match = next((t for t in tests if t.get("case_id") == case_id), None)
+        if not match:
+            continue
+        # find latest result for that test in that run
+        results = await get_results_for_run(run["id"], limit=500)
+        latest = next((r for r in results if r.get("test_id") == match["id"]), None)
+        trace.append({
+            "run_id": run["id"],
+            "run_name": run.get("name"),
+            "completed": run.get("is_completed", False),
+            "status": match["status"],
+            "comment": (latest.get("comment") if latest else "") or "",
+        })
+
+    pass_count = sum(1 for t in trace if t["status"] == "passed")
+    fail_count = sum(1 for t in trace if t["status"] == "failed")
+    # Count flips in the status sequence
+    statuses = [t["status"] for t in trace if t["status"] in ("passed", "failed")]
+    flips = sum(1 for i in range(1, len(statuses)) if statuses[i] != statuses[i - 1])
+    is_flaky = pass_count > 0 and fail_count > 0 and flips >= 2
+
+    return {
+        "case_id": case_id,
+        "runs_scanned": len(trace),
+        "passed": pass_count,
+        "failed": fail_count,
+        "flips": flips,
+        "is_flaky": is_flaky,
+        "trace": trace,
     }
 
 

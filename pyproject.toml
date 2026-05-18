@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "testrail-mcp-server"
-version = "0.1.1"
+version = "0.2.0"
 description = "MCP server for TestRail — CRUD plus AI test-case generation from text, Jira tickets, and Confluence pages"
 readme = "README.md"
 requires-python = ">=3.10"
