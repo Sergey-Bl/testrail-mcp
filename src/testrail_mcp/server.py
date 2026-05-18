@@ -264,33 +264,6 @@ def _jira_to_context(issue: dict) -> tuple[str, str, str]:
 # Case-generation prompt — ported verbatim from the original Slack-bot prototype
 # ──────────────────────────────────────────────────────────────────────
 
-CASE_GEN_SYSTEM = """You are a QA engineer. Given a feature specification or Jira issue, generate test cases.
-Output ONLY valid JSON array, no markdown, no explanation.
-
-Each test case:
-{
-  "title": "Short descriptive title",
-  "preconditions": "Setup needed before test (empty string if none)",
-  "steps": [
-    {"step": "Action to perform", "expected": "Expected result"}
-  ]
-}
-
-Rules:
-- Cover happy path, edge cases, negative cases
-- Steps should be clear and atomic
-- Expected results should be specific and verifiable
-- Group logically: UI elements → core logic → edge cases → config
-- 15-30 cases total depending on feature complexity
-- Titles in English
-
-If "## HOUSE STYLE EXAMPLES" appears in the user message, the cases there
-were authored by humans in this exact TestRail project. Match their tone,
-naming, level of detail, step granularity, expected-result phrasing, and
-how preconditions are written. The goal is that a reader cannot tell which
-cases are new vs which already existed."""
-
-
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+);")
 _WHITESPACE_RE = re.compile(r"[ \t]*\n[ \t]*")
@@ -331,26 +304,6 @@ def _simplify_case(case: dict) -> dict:
     }
 
 
-def _format_house_style_block(examples: list[dict]) -> str:
-    if not examples:
-        return ""
-    parts = ["## HOUSE STYLE EXAMPLES",
-             "Below are existing cases in the target section. New cases must match this style."]
-    for i, ex in enumerate(examples, 1):
-        parts.append("")
-        parts.append(f"### Example {i}")
-        parts.append(f"Title: {ex['title']}")
-        if ex.get("preconditions"):
-            parts.append(f"Preconditions: {ex['preconditions']}")
-        parts.append("Steps:")
-        for j, s in enumerate(ex.get("steps", []), 1):
-            parts.append(f"  {j}. {s.get('step','')}")
-            if s.get("expected"):
-                parts.append(f"     Expected: {s['expected']}")
-    parts.append("")
-    return "\n".join(parts) + "\n"
-
-
 CASE_SCHEMA = {
     "title": "Action-oriented title under 90 chars",
     "preconditions": "Setup needed (empty string if none)",
@@ -358,16 +311,25 @@ CASE_SCHEMA = {
 }
 
 GENERATION_INSTRUCTIONS = (
-    "Generate TestRail test cases for the feature above. Cover happy path, "
-    "edge cases, and negative cases — 15-30 cases depending on feature complexity. "
-    "Group logically: UI elements → core logic → edge cases → config. "
-    "Steps must be atomic (one action per step); 'expected' must be observable, not 'should work'. "
-    "If `style_examples` is non-empty, those cases were authored by humans in this "
-    "TestRail project — match their tone, naming, level of detail, step granularity, "
-    "and expected-result phrasing exactly. A reader should not be able to tell which "
-    "cases are new vs which already existed. "
-    "When you have the cases array, push them in ONE call to `add_test_cases_bulk` "
-    "with the section_hierarchy from `target.section_path` (or section_id if known)."
+    "You are a senior QA engineer. Generate TestRail test cases for the feature above.\n"
+    "\n"
+    "Rules:\n"
+    "- Cover happy path, edge cases, and negative cases — 15-30 cases depending on feature complexity.\n"
+    "- Steps must be atomic — one user action per step. Not 'open page and click button'.\n"
+    "- 'expected' must be an observable result, not 'should work' / 'no errors'.\n"
+    "- Group logically: UI elements → core logic → edge cases → config.\n"
+    "- Titles in English, action-oriented, under 90 characters.\n"
+    "- Each case follows the `schema` shape exactly.\n"
+    "\n"
+    "House style:\n"
+    "- If `style_examples` is non-empty, those cases were authored by humans in this exact "
+    "TestRail project. Match their tone, naming, level of detail, step granularity, "
+    "expected-result phrasing, and how preconditions are written. A reader should not be "
+    "able to tell which cases are new vs which already existed.\n"
+    "\n"
+    "After generation: call `add_test_cases_bulk` ONCE with the full cases array and the "
+    "`section_hierarchy` from `target.section_path` (or `section_id` if you already know it). "
+    "Do not loop or call it once per case."
 )
 
 
