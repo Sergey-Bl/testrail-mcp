@@ -8,13 +8,16 @@ Built on the official Python MCP SDK ([FastMCP](https://github.com/modelcontextp
 
 **CRUD over TestRail**
 - `list_projects` — projects visible to the user
+- `list_suites` — suites under a project
 - `search_test_cases` — list cases under a project / suite / section, optionally filter by title substring
 - `get_test_case` — fetch one case by ID
 - `create_test_case` — create a case in a section
+- `get_or_create_section` — resolve a path like `1.5.0 > Tournament Race > Edge Cases`, creating missing nodes
 
 **AI tools (the actual differentiator)**
-- `generate_cases_from_text` — feed a PRD chunk / spec / bug report → get TestRail-shaped cases, optionally created in the given section
-- `generate_cases_from_jira` — pass a Jira issue key, the server pulls the ticket and generates cases in one call
+- `generate_cases_from_text` — feed a PRD chunk / spec / bug report → get TestRail-shaped cases, optionally created in the given section (by ID or by hierarchy string)
+- `generate_cases_from_jira` — pass a Jira issue key (e.g. `SH-1950`); server fetches summary, description, comments, subtasks, walks the ADF tree, generates cases
+- `generate_cases_from_confluence` — pass a Confluence page ID; same flow, HTML body stripped to plain text
 
 ## Quick start
 
@@ -78,16 +81,32 @@ In `~/.cursor/mcp.json`:
 
 ## Configuration
 
-| Env var               | Required | Purpose                                    |
-| --------------------- | -------- | ------------------------------------------ |
-| `TESTRAIL_BASE_URL`   | yes      | e.g. `https://your-org.testrail.io`        |
-| `TESTRAIL_USER`       | yes      | TestRail account email                     |
-| `TESTRAIL_API_KEY`    | yes      | from My Settings → API Keys                |
-| `ANTHROPIC_API_KEY`   | yes      | required for the AI generation tools       |
-| `JIRA_BASE_URL`       | optional | only for `generate_cases_from_jira`        |
-| `JIRA_USER`           | optional | Jira account email                         |
-| `JIRA_API_TOKEN`      | optional | https://id.atlassian.com/manage-profile    |
-| `CASE_GEN_MODEL`      | optional | defaults to `claude-sonnet-4-6`            |
+| Env var                 | Required | Purpose                                                |
+| ----------------------- | -------- | ------------------------------------------------------ |
+| `TESTRAIL_BASE_URL`     | yes      | e.g. `https://your-org.testrail.io`                    |
+| `TESTRAIL_USER`         | yes      | TestRail account email                                 |
+| `TESTRAIL_API_KEY`      | yes      | from My Settings → API Keys                            |
+| `TESTRAIL_PROJECT_ID`   | optional | default project ID for tools that take it              |
+| `TESTRAIL_SUITE_ID`     | optional | default suite ID                                       |
+| `TR_TEMPLATE_ID`        | optional | default template (2 = "Test Case (Steps)")             |
+| `TR_TYPE_ID`            | optional | default case type                                      |
+| `TR_PRIORITY_ID`        | optional | default priority (3 = Medium)                          |
+| `ANTHROPIC_API_KEY`     | yes      | required for AI generation tools                       |
+| `CASE_GEN_MODEL`        | optional | defaults to `claude-haiku-4-5-20251001` (cheap + fast) |
+| `JIRA_BASE_URL`         | optional | only for `generate_cases_from_jira`                    |
+| `JIRA_USER`             | optional | Jira account email                                     |
+| `JIRA_API_TOKEN`        | optional | https://id.atlassian.com/manage-profile                |
+| `CONFLUENCE_BASE_URL`   | optional | only for `generate_cases_from_confluence`              |
+| `CONFLUENCE_EMAIL`      | optional | defaults to `JIRA_USER`                                |
+| `CONFLUENCE_API_TOKEN`  | optional | defaults to `JIRA_API_TOKEN`                           |
+
+## Example: from a Jira ticket straight into TestRail
+
+In Claude Code or Claude Desktop, after the server is registered:
+
+> Generate test cases from `SH-1950` and put them under `1.5.0 > Tournament Race > Smoke`.
+
+The server walks the section path (creating missing nodes), pulls the Jira ticket, generates ~15-30 cases, then bulk-creates them with house-style defaults (template 2, type 7, priority 3). Reply contains every new case ID.
 
 ## Roadmap
 
