@@ -16,10 +16,8 @@ Or inspect interactively:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
-import time
 from base64 import b64encode
 from typing import Any
 
@@ -83,13 +81,37 @@ async def _tr_request(method: str, path: str, retries: int = 3, **kwargs) -> Any
         for attempt in range(retries):
             resp = await client.request(method, url, headers=headers, **kwargs)
             if resp.status_code == 429:
-                # TestRail rate limit — back off as instructed
+                # TestRail rate limit — back off as instructed. Must be async so a
+                # rate-limited request doesn't freeze the whole MCP event loop.
                 retry_after = int(resp.headers.get("Retry-After", "60"))
-                time.sleep(min(retry_after, 90))
+                await asyncio.sleep(min(retry_after, 90))
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else None
         raise RuntimeError(f"TestRail request failed after {retries} retries: {path}")
+
+
+async def _tr_get_all(path_base: str, key: str, cap: int = 5000, page: int = 250) -> list:
+    """Page through a TestRail list endpoint using offset pagination.
+
+    TestRail API v2 caps each response at 250 items, so a single request silently
+    truncates large runs/sections. This walks `offset` until a short page (or the
+    wrapped response's `_links.next` is null), up to `cap` items. Works with both
+    the newer wrapped response and the older bare-list response.
+    """
+    out: list = []
+    offset = 0
+    while len(out) < cap:
+        data = await _tr_request("GET", f"{path_base}&limit={page}&offset={offset}")
+        chunk = _unwrap(data, key)
+        out.extend(chunk)
+        if len(chunk) < page:
+            break  # last (short) page — nothing more to fetch
+        links = data.get("_links") if isinstance(data, dict) else None
+        if links is not None and links.get("next") is None:
+            break  # wrapped response explicitly has no next page
+        offset += page
+    return out[:cap]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -406,13 +428,23 @@ def _case_to_testrail_payload(case: dict) -> dict:
 # Section hierarchy helper — ports qa_bot.get_or_create_section
 # ──────────────────────────────────────────────────────────────────────
 
-_section_cache: dict[tuple[str, int | None], int] = {}
+# Cache keyed by (project_id, suite_id, name, parent_id) so sections with the
+# same name in different projects/suites never collide.
+_section_cache: dict[tuple[int, int, str, int | None], int] = {}
+_sections_loaded: set[tuple[int, int]] = set()
+
+
+def _invalidate_sections() -> None:
+    """Drop cached sections so the next resolve reloads fresh from TestRail."""
+    _section_cache.clear()
+    _sections_loaded.clear()
 
 
 async def _load_sections(project_id: int, suite_id: int) -> None:
     resp = await _tr_request("GET", f"get_sections/{project_id}&suite_id={suite_id}")
     for s in _unwrap(resp, "sections"):
-        _section_cache[(s["name"], s.get("parent_id"))] = s["id"]
+        _section_cache[(project_id, suite_id, s["name"], s.get("parent_id"))] = s["id"]
+    _sections_loaded.add((project_id, suite_id))
 
 
 async def _resolve_section(
@@ -424,12 +456,12 @@ async def _resolve_section(
     if not parts:
         raise ValueError("Empty section hierarchy")
 
-    if not _section_cache:
+    if (project_id, suite_id) not in _sections_loaded:
         await _load_sections(project_id, suite_id)
 
     parent_id: int | None = None
     for part in parts:
-        key = (part, parent_id)
+        key = (project_id, suite_id, part, parent_id)
         if key not in _section_cache:
             if not create_missing:
                 raise ValueError(f"Section not found: {' > '.join(parts)} (missing '{part}')")
@@ -438,7 +470,7 @@ async def _resolve_section(
                 payload["parent_id"] = parent_id
             result = await _tr_request("POST", f"add_section/{project_id}", json=payload)
             _section_cache[key] = result["id"]
-            time.sleep(0.4)
+            await asyncio.sleep(0.4)
         parent_id = _section_cache[key]
     return parent_id  # type: ignore[return-value]
 
@@ -836,7 +868,7 @@ async def add_test_cases_bulk(
             raise ValueError("Pass section_id or section_hierarchy.")
         if not (pid and sid):
             raise ValueError("project_id and suite_id required (or set in .env).")
-        _section_cache.clear()
+        _invalidate_sections()
         target_section_id = await _resolve_section(pid, sid, section_hierarchy, True)
 
     created: list[dict] = []
@@ -845,7 +877,7 @@ async def add_test_cases_bulk(
         try:
             res = await create_test_case(section_id=target_section_id, case=c)
             created.append({"id": res["id"], "title": c.get("title", "")})
-            time.sleep(0.3)  # gentle on TestRail rate limit
+            await asyncio.sleep(0.3)  # gentle on TestRail rate limit
         except Exception as e:
             failed.append({"title": c.get("title", ""), "error": str(e)})
 
@@ -1033,9 +1065,11 @@ async def get_run(run_id: int) -> dict:
 
 @mcp.tool()
 async def get_tests_in_run(run_id: int, limit: int = 250) -> list[dict]:
-    """Tests in a run with their current status (current = latest result)."""
-    data = await _tr_request("GET", f"get_tests/{run_id}&limit={min(limit, 250)}")
-    tests = _unwrap(data, "tests")
+    """Tests in a run with their current status (current = latest result).
+
+    Pages past TestRail's 250-per-response cap so large runs aren't truncated.
+    """
+    tests = await _tr_get_all(f"get_tests/{run_id}", "tests", cap=limit)
     return [{
         "id": t["id"],
         "case_id": t.get("case_id"),
@@ -1049,9 +1083,11 @@ async def get_tests_in_run(run_id: int, limit: int = 250) -> list[dict]:
 
 @mcp.tool()
 async def get_results_for_run(run_id: int, limit: int = 250) -> list[dict]:
-    """All result entries for a run — includes comments, defects, who tested when."""
-    data = await _tr_request("GET", f"get_results_for_run/{run_id}&limit={min(limit, 250)}")
-    results = _unwrap(data, "results")
+    """All result entries for a run — includes comments, defects, who tested when.
+
+    Pages past TestRail's 250-per-response cap so large runs aren't truncated.
+    """
+    results = await _tr_get_all(f"get_results_for_run/{run_id}", "results", cap=limit)
     return [{
         "id": r["id"],
         "test_id": r.get("test_id"),
@@ -1096,8 +1132,8 @@ async def prepare_run_summary(
     Set True only for tiny runs (<50 tests) when full granularity is useful.
     """
     run = await get_run(run_id)
-    tests = await get_tests_in_run(run_id, limit=500)
-    results = await get_results_for_run(run_id, limit=500)
+    tests = await get_tests_in_run(run_id, limit=5000)
+    results = await get_results_for_run(run_id, limit=5000)
 
     latest_by_test: dict[int, dict] = {}
     for r in results:
@@ -1329,10 +1365,10 @@ async def prepare_runs_diff(run_id_a: int, run_id_b: int) -> dict:
     A is the baseline (older), B is the newer run. No LLM call happens server-side.
     """
     tests_a, tests_b = await asyncio.gather(
-        get_tests_in_run(run_id_a, limit=500),
-        get_tests_in_run(run_id_b, limit=500),
+        get_tests_in_run(run_id_a, limit=5000),
+        get_tests_in_run(run_id_b, limit=5000),
     )
-    results_b = await get_results_for_run(run_id_b, limit=500)
+    results_b = await get_results_for_run(run_id_b, limit=5000)
     latest_b_by_test: dict[int, dict] = {}
     for r in results_b:
         tid = r.get("test_id")
@@ -1396,12 +1432,12 @@ async def flaky_test_detector(
         if len(trace) >= last_n_runs:
             break
         # find test for this case in this run
-        tests = await get_tests_in_run(run["id"], limit=500)
+        tests = await get_tests_in_run(run["id"], limit=2000)
         match = next((t for t in tests if t.get("case_id") == case_id), None)
         if not match:
             continue
         # find latest result for that test in that run
-        results = await get_results_for_run(run["id"], limit=500)
+        results = await get_results_for_run(run["id"], limit=2000)
         latest = next((r for r in results if r.get("test_id") == match["id"]), None)
         trace.append({
             "run_id": run["id"],
